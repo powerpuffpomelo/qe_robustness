@@ -1,0 +1,55 @@
+data_configs:
+  lang_pair: "zh-en"
+  train_data:
+    - "/home/data_ti4_c/yanym/data/wmt20/enzh/parallel/mello_version/test.zh_100w.BPE"
+    - "/home/data_ti4_c/yanym/data/wmt20/enzh/parallel/mello_version/test.en_100w.BPE"
+    - "/home/data_ti4_c/yanym/data/wmt20/enzh/parallel/mello_version/alignments/test.index"
+  vocabularies:
+    - type: "bpe"
+      dict_path: "/home/data_ti4_c/yanym/data/wmt20/enzh/parallel/mello_version/vocab.zh"
+      max_n_words: -1
+    - type: "bpe"
+      dict_path: "/home/data_ti4_c/yanym/data/wmt20/enzh/parallel/mello_version/vocab.en"
+      max_n_words: -1
+  max_len:
+    - 120
+    - 120
+  num_refs: 1
+  eval_at_char_level: false
+
+model_configs:
+  model: Transformer
+  n_layers: 6
+  n_head: 8
+  d_word_vec: 256
+  d_model: 256
+  d_inner_hid: 1024
+  dropout: 0.1
+  proj_share_weight: false
+  label_smoothing: 0.0
+
+optimizer_configs:
+  optimizer: "adam"
+  learning_rate: 0.2
+  grad_clip: -1.0
+  optimizer_params: ~
+  schedule_method: noam
+  scheduler_configs:
+    d_model: 256
+    warmup_steps: 8000
+
+training_configs:
+  seed: 1234
+  max_epochs: 100
+  shuffle: true
+  use_bucket: true
+  batch_size: 10000
+  batching_key: "tokens"
+  update_cycle: 20
+  valid_batch_size: 20
+  disp_freq: 200
+  save_freq: 200
+  num_kept_checkpoints: 1
+  loss_valid_freq: 200
+  early_stop_patience: 20
+

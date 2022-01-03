@@ -1,0 +1,63 @@
+data_configs:
+  lang_pair: "zh-en"
+  train_data:
+    - "/home/user_data55/cuiq/QE/data/enzh/CCMT20/zhen-sentence-qe/train/train.src.segment"
+    - "/home/user_data55/cuiq/QE/data/enzh/CCMT20/zhen-sentence-qe/train/train.tgt.BPE"
+    - "/home/user_data55/cuiq/QE/data/enzh/CCMT20/zhen-sentence-qe/train/train.tags_word_BPE"
+    - "/home/user_data55/cuiq/QE/data/enzh/CCMT20/zhen-sentence-qe/train/train.hter"
+  valid_data:
+    - "/home/user_data55/cuiq/QE/data/enzh/CCMT20/zhen-sentence-qe/dev/dev.src.segment"
+    - "/home/user_data55/cuiq/QE/data/enzh/CCMT20/zhen-sentence-qe/dev/dev.tgt.BPE"
+    - "/home/user_data55/cuiq/QE/data/enzh/CCMT20/zhen-sentence-qe/dev/dev.tags_word_BPE"
+    - "/home/user_data55/cuiq/QE/data/enzh/CCMT20/zhen-sentence-qe/dev/dev.hter"
+  vocabularies:
+    - type: "word"
+      dict_path: "/home/user_data55/cuiq/QE/data/enzh/CCMT20/vocab.zh.json"
+      max_n_words: 40000
+    - type: "word"
+      dict_path: "/home/user_data55/cuiq/QE/data/enzh/CCMT20/vocab.en.json"
+      max_n_words: -1
+  max_len:
+    - -1
+    - -1
+  num_refs: 1
+  eval_at_char_level: false
+
+discriminator_configs:
+  model: Discriminator
+  n_layers: 6
+  n_head: 8
+  n_labels: 3
+  d_word_vec: 512
+  d_model: 512
+  d_inner_hid: 2048
+  dropout: 0.1
+  proj_share_weight: false
+  label_smoothing: 0.0
+
+optimizer_configs:
+  optimizer: "adam"
+  learning_rate: 0.0001
+  weight_decay: 0
+  grad_clip: 1.0
+  optimizer_params: ~
+  schedule_method: ~
+  scheduler_configs:
+    d_model: 512
+    warmup_steps: 100
+
+training_configs:
+  seed: 1234
+  max_epochs: 50
+  shuffle: false
+  use_bucket: false
+  buffer_size: 1000
+  batch_size: 1
+  batching_key: "samples"
+  update_cycle: 30
+  valid_batch_size: 1
+  disp_freq: 60
+  save_freq: 1200
+  num_kept_checkpoints: 1
+  loss_valid_freq: 1200
+  early_stop_patience: 10
