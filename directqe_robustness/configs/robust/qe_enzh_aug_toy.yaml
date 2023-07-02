@@ -1,0 +1,86 @@
+data_configs:
+  lang_pair: "en-zh"
+  train_data:
+    - "/data1/yanym/data/robust_qe_train_v1/toy/toy_robust_train.src.BPE"
+    - "/data1/yanym/data/robust_qe_train_v1/toy/toy_robust_train.mt.BPE"
+    - "/data1/yanym/data/robust_qe_train_v1/toy/toy_robust_train.tag.BPE"
+    - "/data1/yanym/data/robust_qe_train_v1/toy/toy_robust_train.hter"
+    - "/data1/yanym/data/robust_qe_train_v1/toy/toy_robust_train.idx.BPE"
+  normal_train_data:
+    - "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/train.src.BPE"
+    - "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/train.mt.BPE"
+    - "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/train.tag.BPE"
+    - "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/train.hter"
+  valid_data:
+    - "/data1/yanym/data/robust_qe_train_v1/toy/toy_robust_train.src.BPE"
+    - "/data1/yanym/data/robust_qe_train_v1/toy/toy_robust_train.mt.BPE"
+    - "/data1/yanym/data/robust_qe_train_v1/toy/toy_robust_train.tag.BPE"
+    - "/data1/yanym/data/robust_qe_train_v1/toy/toy_robust_train.hter"
+    - "/data1/yanym/data/robust_qe_train_v1/toy/toy_robust_train.idx.BPE"
+  test_data:
+    - "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/test.src.BPE"
+    - "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/test.mt.BPE"
+    - "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/test.tag.BPE"
+    - "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/test.hter"
+  vocabularies:
+    - type: "word"
+      dict_path: "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/vocab.en"
+      max_n_words: -1
+    - type: "word"
+      dict_path: "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/vocab.zh"
+      max_n_words: -1
+  max_len:
+    - -1
+    - -1
+  num_refs: 1
+  eval_at_char_level: false
+
+generator_configs:
+  model: Transformer
+  n_layers: 6
+  n_head: 8
+  d_word_vec: 256
+  d_model: 256
+  d_inner_hid: 1024
+  dropout: 0.1
+  proj_share_weight: false
+  label_smoothing: 0.0
+
+discriminator_configs:
+  model: Discriminator
+  n_layers: 6
+  n_head: 8
+  n_labels: 3
+  d_word_vec: 256
+  d_model: 256
+  d_inner_hid: 1024
+  dropout: 0.1
+  proj_share_weight: false
+  label_smoothing: 0.0
+
+optimizer_configs:
+  optimizer: "adam"
+  learning_rate: 0.0001
+  weight_decay: 0
+  grad_clip: 1.0
+  optimizer_params: ~
+  schedule_method: ~
+  scheduler_configs:
+    d_model: 512
+    warmup_steps: 100
+
+training_configs:
+  seed: 1234
+  max_epochs: 50
+  shuffle: false
+  use_bucket: false
+  buffer_size: 1000
+  batch_size: 1
+  batching_key: "samples"
+  update_cycle: 1
+  valid_batch_size: 1
+  disp_freq: 20
+  save_freq: 1200
+  num_kept_checkpoints: 1
+  loss_valid_freq: 1200
+  early_stop_patience: 20

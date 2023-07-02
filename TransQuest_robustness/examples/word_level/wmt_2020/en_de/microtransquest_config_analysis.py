@@ -34,9 +34,9 @@ MODEL_TYPE = "xlmroberta"
 MODEL_NAME = "xlm-roberta-large"
 
 microtransquest_config = {
-    'output_dir': '/home/yanym/save/transquest_wmt20_ende/outputs/',
-    "best_model_dir": "/home/yanym/save/transquest_wmt20_ende/outputs/best_model",
-    'cache_dir': '/home/yanym/save/transquest_wmt20_ende/cache_dir/',
+    'output_dir': '/data1/yanym/save/transquest_wmt20_ende/outputs/',
+    "best_model_dir": "/data1/yanym/save/transquest_wmt20_ende/outputs/best_model",
+    'cache_dir': '/data1/yanym/save/transquest_wmt20_ende/cache_dir/',
 
     'fp16': False,
     'fp16_opt_level': 'O1',
@@ -67,7 +67,7 @@ microtransquest_config = {
     'use_cached_eval_features': False,
     "save_best_model": True,
     'save_eval_checkpoints': True,
-    'tensorboard_dir': '/home/yanym/save/transquest_wmt20_ende/runs/test_run',
+    'tensorboard_dir': '/data1/yanym/save/transquest_wmt20_ende/runs/test_run',
     "save_optimizer_and_scheduler": True,
 
     'regression': True,

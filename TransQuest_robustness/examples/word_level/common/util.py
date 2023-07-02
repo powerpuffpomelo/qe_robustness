@@ -3,7 +3,7 @@ import os
 import pandas as pd
 
 
-def reader(path, source_file, target_file, source_tags_file=None, target_tags_file=None):
+def reader(path, source_file, target_file, source_tags_file=None, target_tags_file=None, robust_idx_file=None):
     with open(os.path.join(path, source_file)) as f:
         source_sentences = f.read().splitlines()
 
@@ -17,14 +17,27 @@ def reader(path, source_file, target_file, source_tags_file=None, target_tags_fi
         with open(os.path.join(path, target_tags_file)) as f:
             target_tags = f.read().splitlines()
 
-        df = pd.DataFrame(
-            {
-                "source": source_sentences,
-                "target": target_sentences,
-                "source_tags": source_tags,
-                "target_tags": target_tags
-            }
-        )
+        if(robust_idx_file is None):
+            df = pd.DataFrame(
+                {
+                    "source": source_sentences,
+                    "target": target_sentences,
+                    "source_tags": source_tags,
+                    "target_tags": target_tags
+                }
+            )
+        else:
+            with open(os.path.join(path, robust_idx_file)) as f:
+                robust_idx_lines = f.read().splitlines()
+            df = pd.DataFrame(
+                {
+                    "source": source_sentences,
+                    "target": target_sentences,
+                    "source_tags": source_tags,
+                    "target_tags": target_tags,
+                    "robust_idx": robust_idx_lines
+                }
+            )
 
     else:
         df = pd.DataFrame(

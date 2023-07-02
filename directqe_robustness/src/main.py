@@ -11,8 +11,8 @@ import math
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn import metrics, manifold
+#import seaborn as sns
+#from sklearn import metrics, manifold
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,7 +21,7 @@ from tensorboardX import SummaryWriter
 from tqdm import tqdm
 from scipy.stats import pearsonr
 from collections import Counter
-from transformers import BertModel, BertTokenizer
+#from transformers import BertModel, BertTokenizer
 
 import src.distributed as dist
 from src.data.data_iterator import DataIterator
@@ -30,7 +30,7 @@ from src.data.vocabulary import Vocabulary
 from src.decoding import beam_search
 from src.models import build_model, load_predefined_configs
 from src.models import LinearProbe
-from src.modules.criterions import NMTCriterion
+from src.modules.criterions import NMTCriterion, NMTCriterionFocalLoss, NMTCriterionMarginLoss
 from src.optim import Optimizer
 from src.optim.lr_scheduler import build_scheduler
 from src.utils.common_utils import *
@@ -625,6 +625,7 @@ def compute_forward_discriminator(model,
                                   normalization=1.0,
                                   norm_by_words=False,
                                   return_hter_pre=False,
+                                  requires_adapter=False,
                                   ):
 
     y_inp = seqs_y[:, :].contiguous()
@@ -636,17 +637,7 @@ def compute_forward_discriminator(model,
         critic.train()
         # For training
         with torch.enable_grad():
-            log_probs, hter_pre = model(seqs_x, y_inp)  #model返回tag和hter分别需要的部分
-            
-            #print("********************criterion")
-            #print(log_probs.size())
-            #print(log_probs)
-            #print(hter_pre.size())
-            #print(hter_pre)
-            #print(y_label.size())
-            #print(y_label)
-            #print(hter_label.size())
-            #print(hter_label)
+            log_probs, hter_pre = model(seqs_x, y_inp, requires_adapter=requires_adapter)  #model返回tag和hter分别需要的部分
             
             loss = critic(inputs=log_probs, labels=y_label, reduce=False, normalization=normalization)
             loss_hter = critic_mse(hter_pre, hter_label)
@@ -655,12 +646,171 @@ def compute_forward_discriminator(model,
                 loss = loss.div(words_norm).sum()
             else:
                 loss = loss.sum()
-        #print("================in compute_forward_discriminator")
-        #print(loss)
-        #print(loss_hter)
-        #assert 1==2
-        # loss /= 10000
-        #loss_hter *= 10000
+
+        torch.autograd.backward(loss + loss_hter, retain_graph=True)  # backward的就是两个loss加一起
+        if return_hter_pre == True:
+            return loss.item(), loss_hter.item(), hter_pre
+        return loss.item(), loss_hter.item()
+    else:
+        model.eval()
+        critic.eval()
+        # For compute loss
+        with torch.no_grad():
+            log_probs, hter_pre = model(seqs_x, y_inp, requires_adapter=requires_adapter)
+
+            loss = critic(inputs=log_probs, labels=y_label, normalization=normalization, reduce=True)
+            loss_hter = critic_mse(hter_pre, hter_label)
+
+        return loss.item(), loss_hter.item(), log_probs, hter_pre
+
+
+def compute_forward_discriminator_margin(model,
+                                    critic,
+                                    critic_mse,
+                                    seqs_x,
+                                    seqs_y,
+                                    lm_ids,
+                                    hter_label,
+                                    eval=False,
+                                    normalization=1.0,
+                                    norm_by_words=False,
+                                    return_hter_pre=False,
+                                    ):
+
+    y_inp = seqs_y[:, :].contiguous()
+    y_label = lm_ids[:, 2:-1].contiguous()
+    words_norm = y_label.ne(Constants.PAD).float().sum(1)
+
+    if not eval:
+        model.train()
+        critic.train()
+        # For training
+        with torch.enable_grad():
+            log_probs, hter_pre = model(seqs_x, y_inp, margin_loss=True)  #model返回tag和hter分别需要的部分
+
+            loss = critic(inputs=log_probs, labels=y_label, reduce=False, normalization=normalization)
+            loss_hter = critic_mse(hter_pre, hter_label)
+
+            if norm_by_words:
+                loss = loss.div(words_norm).sum()
+            else:
+                loss = loss.sum()
+
+        torch.autograd.backward(loss + loss_hter, retain_graph=True)  # backward的就是两个loss加一起
+        if return_hter_pre == True:
+            return loss.item(), loss_hter.item(), hter_pre
+        return loss.item(), loss_hter.item()
+    else:
+        model.eval()
+        critic.eval()
+        # For compute loss
+        with torch.no_grad():
+            log_probs, hter_pre = model(seqs_x, y_inp, margin_loss=True)
+
+            loss = critic(inputs=log_probs, labels=y_label, normalization=normalization, reduce=True)
+            loss_hter = critic_mse(hter_pre, hter_label)
+
+        return loss.item(), loss_hter.item(), log_probs, hter_pre
+
+
+def compute_forward_discriminator_one_class(model,
+                                  critic,
+                                  critic_mse,
+                                  seqs_x,
+                                  seqs_y,
+                                  lm_ids,
+                                  hter_label,
+                                  eval=False,
+                                  normalization=1.0,
+                                  norm_by_words=False,
+                                  return_hter_pre=False,
+                                  no_sigmoid=False,
+                                  ):
+
+    y_inp = seqs_y[:, :].contiguous()
+    y_label = lm_ids[:, 2:-1].contiguous()
+    words_norm = y_label.ne(Constants.PAD).float().sum(1)
+
+    if not eval:
+        model.train()
+        critic.train()
+        # For training
+        with torch.enable_grad():
+            log_probs, hter_pre = model(seqs_x, y_inp, one_class=True, no_sigmoid=no_sigmoid)  #model返回tag和hter分别需要的部分
+
+            loss = critic(inputs=log_probs, labels=y_label, reduce=False, normalization=normalization)
+            loss_hter = critic_mse(hter_pre, hter_label)
+
+            if norm_by_words:
+                loss = loss.div(words_norm).sum()
+            else:
+                loss = loss.sum()
+
+        torch.autograd.backward(loss + loss_hter, retain_graph=True)  # backward的就是两个loss加一起
+        if return_hter_pre == True:
+            return loss.item(), loss_hter.item(), hter_pre
+        return loss.item(), loss_hter.item()
+    else:
+        model.eval()
+        critic.eval()
+        # For compute loss
+        with torch.no_grad():
+            log_probs, hter_pre = model(seqs_x, y_inp, one_class=True)
+
+            loss = critic(inputs=log_probs, labels=y_label, normalization=normalization, reduce=True, no_sigmoid=no_sigmoid)
+            loss_hter = critic_mse(hter_pre, hter_label)
+
+        return loss.item(), loss_hter.item(), log_probs, hter_pre
+
+
+def compute_forward_discriminator_robust_aug_anti(model,
+                                                critic,
+                                                critic_mse,
+                                                seqs_x,
+                                                seqs_y,
+                                                lm_ids,
+                                                hter_label,
+                                                eval=False,
+                                                aug_lambda=0.1,
+                                                normalization=1.0,
+                                                norm_by_words=False,
+                                                return_hter_pre=False,
+                                                ):
+
+
+    y_inp = seqs_y[:, :].contiguous()
+    y_label = lm_ids[:, 2:-1].contiguous()
+    words_norm = y_label.ne(Constants.PAD).float().sum(1)
+    
+    anti_aug_x = torch.zeros_like(seqs_x)
+    for i in range(anti_aug_x.size(-1)):
+        anti_aug_x[0, i] = Constants.PAD
+
+    anti_aug_label = torch.zeros_like(y_label)
+    for i in range(anti_aug_label.size(-1)):
+        anti_aug_label[0, i] = random.randint(1, 2)
+
+
+    if not eval:
+        model.train()
+        critic.train()
+        # For training
+        with torch.enable_grad():
+            log_probs, hter_pre = model(seqs_x, y_inp)  #model返回tag和hter分别需要的部分
+            aug_log_probs, aug_hter_pre = model(anti_aug_x, y_inp)
+
+            loss = critic(inputs=log_probs, labels=y_label, reduce=False, normalization=normalization)
+            aug_loss = critic(inputs=aug_log_probs, labels=anti_aug_label, reduce=False, normalization=normalization)
+
+            loss_hter = critic_mse(hter_pre, hter_label)
+
+            loss = loss + aug_loss * aug_lambda
+
+            if norm_by_words:
+                loss = loss.div(words_norm).sum()
+            else:
+                loss = loss.sum()
+
         torch.autograd.backward(loss + loss_hter, retain_graph=True)  # backward的就是两个loss加一起
         if return_hter_pre == True:
             return loss.item(), loss_hter.item(), hter_pre
@@ -687,6 +837,7 @@ def compute_forward_discriminator_align_v1(model,
                                     lm_ids,
                                     hter_label,
                                     align_line,
+                                    align_ratio=0.5,
                                     eval=False,
                                     normalization=1.0,
                                     norm_by_words=False,
@@ -712,7 +863,7 @@ def compute_forward_discriminator_align_v1(model,
         critic.train()
         # For training
         with torch.enable_grad():
-            log_probs, hter_pre = model(seqs_x, y_inp, align_matrix_pad = align_matrix_pad)  #model返回tag和hter分别需要的部分
+            log_probs, hter_pre = model(seqs_x, y_inp, align_matrix_pad = align_matrix_pad, align_ratio=align_ratio)  #model返回tag和hter分别需要的部分
             
             loss = critic(inputs=log_probs, labels=y_label, reduce=False, normalization=normalization)
             loss_hter = critic_mse(hter_pre, hter_label)
@@ -731,7 +882,7 @@ def compute_forward_discriminator_align_v1(model,
         critic.eval()
         # For compute loss
         with torch.no_grad():
-            log_probs, hter_pre = model(seqs_x, y_inp, align_matrix_pad = align_matrix_pad)
+            log_probs, hter_pre = model(seqs_x, y_inp, align_matrix_pad = align_matrix_pad, align_ratio=align_ratio)
             loss = critic(inputs=log_probs, labels=y_label, normalization=normalization, reduce=True)
             loss_hter = critic_mse(hter_pre, hter_label)
 
@@ -774,21 +925,37 @@ def compute_forward_discriminator_align_v2(model,
         # For training
         with torch.enable_grad():
             log_probs, hter_pre, ctx_attn = model(seqs_x, y_inp, return_attn = True)  #model返回tag和hter分别需要的部分
-            ctx_attn = torch.cat(ctx_attn, dim = 1)  # [batch_size, layer_num * head_num, seq_y_len + 3, seq_x_len + 2]
-            ctx_attn_real = ctx_attn[:, :, 2:-1, 1:-1]  # 去掉无关部分，<bos><eos> 这里把hter也去掉了，可能会有影响？
+
+            # all
+            #ctx_attn_all = torch.cat(ctx_attn, dim = 1)  # [batch_size, layer_num * head_num, seq_y_len + 3, seq_x_len + 2]
+            #ctx_attn_real = ctx_attn_all[:, :, 2:-1, 1:-1]  # 去掉无关部分，<bos><eos> 这里把hter也去掉了，可能会有影响？
+
+            # 2layer
+            #ctx_attn_2layer = torch.cat(ctx_attn[3:5], dim = 1)  # [batch_size, choosed_layer_num * head_num, seq_y_len + 3, seq_x_len + 2]
+            ctx_attn_1layer = torch.cat(ctx_attn[5:], dim = 1)  # [batch_size, choosed_layer_num * head_num, seq_y_len + 3, seq_x_len + 2]
+            ctx_attn_real = ctx_attn_1layer[:, :, 2:-1, 1:-1]
+
+            # random
+            #ctx_attn_random = torch.stack((ctx_attn[5][:, 5, :, :], ctx_attn[4][:, 3, :, :]), dim = 1)  # [batch_size, choosed head_num, seq_y_len + 3, seq_x_len + 2]
+            #ctx_attn_real = ctx_attn_random[:, :, 2:-1, 1:-1]
+
+            # most
+            #ctx_attn_most = torch.stack((ctx_attn[5][:, 3, :, :], ctx_attn[4][:, 2, :, :]), dim = 1)  # [batch_size, choosed head_num, seq_y_len + 3, seq_x_len + 2]
+            #ctx_attn_real = ctx_attn_most[:, :, 2:-1, 1:-1]
+
             align_matrix_repeat = align_matrix.repeat(ctx_attn_real.size(0), ctx_attn_real.size(1), 1, 1)
-            #print(ctx_attn_real.size())
-            kl_loss = F.kl_div(ctx_attn_real.log(), align_matrix_repeat.softmax(dim=-1)) * ctx_attn_real.size(1)
+            
+            kl_loss = F.kl_div(ctx_attn_real.log(), align_matrix_repeat.softmax(dim=-1), reduction='sum') / ctx_attn_real.size(1)
             kl_loss *= attn_align_lambda
 
             loss = critic(inputs=log_probs, labels=y_label, reduce=False, normalization=normalization)
             loss_hter = critic_mse(hter_pre, hter_label)
-
+            
             if norm_by_words:
                 loss = loss.div(words_norm).sum()
             else:
                 loss = loss.sum()
-
+            
         torch.autograd.backward(loss + loss_hter + kl_loss, retain_graph=True)  # backward的就是两个loss加一起
         if return_hter_pre == True:
             return loss.item(), loss_hter.item(), hter_pre
@@ -803,6 +970,240 @@ def compute_forward_discriminator_align_v2(model,
             loss_hter = critic_mse(hter_pre, hter_label)
 
         return loss.item(), loss_hter.item(), log_probs, hter_pre
+
+
+def compute_forward_discriminator_align_v3(model,
+                                    critic,
+                                    critic_mse,
+                                    seqs_x,
+                                    seqs_y,
+                                    lm_ids,
+                                    hter_label,
+                                    align_line,
+                                    eval=False,
+                                    normalization=1.0,
+                                    norm_by_words=False,
+                                    return_hter_pre=False,
+                                    attn_align_lambda=0.5,
+                                    ):
+
+    y_inp = seqs_y[:, :].contiguous()
+    y_label = lm_ids[:, 2:-1].contiguous()
+    words_norm = y_label.ne(Constants.PAD).float().sum(1)
+
+    x_len = seqs_x.size(-1) - 2
+    y_len = seqs_y.size(-1) - 3
+
+    align_matrix = torch.zeros([y_len, x_len])
+
+    for i in range(y_len):
+        if str(i) in align_line:
+            align_matrix[i] = align_matrix[i].index_fill(0, torch.tensor(align_line[str(i)]), True)
+
+    align_matrix_pad = F.pad(align_matrix, pad = (1, 1, 2, 1)).cuda()
+    if not eval:
+        model.train()
+        critic.train()
+        # For training
+        with torch.enable_grad():
+            log_probs, hter_pre = model(seqs_x, y_inp, align_matrix_pad = align_matrix_pad, add_align = True, align_ratio=attn_align_lambda)  #model返回tag和hter分别需要的部分
+            
+            loss = critic(inputs=log_probs, labels=y_label, reduce=False, normalization=normalization)
+            loss_hter = critic_mse(hter_pre, hter_label)
+
+            if norm_by_words:
+                loss = loss.div(words_norm).sum()
+            else:
+                loss = loss.sum()
+
+        torch.autograd.backward(loss + loss_hter, retain_graph=True)  # backward的就是两个loss加一起
+        if return_hter_pre == True:
+            return loss.item(), loss_hter.item(), hter_pre
+        return loss.item(), loss_hter.item()
+    else:
+        model.eval()
+        critic.eval()
+        # For compute loss
+        with torch.no_grad():
+            log_probs, hter_pre = model(seqs_x, y_inp, align_matrix_pad = align_matrix_pad, add_align = True, align_ratio=attn_align_lambda)
+            loss = critic(inputs=log_probs, labels=y_label, normalization=normalization, reduce=True)
+            loss_hter = critic_mse(hter_pre, hter_label)
+
+        return loss.item(), loss_hter.item(), log_probs, hter_pre
+
+
+def compute_forward_discriminator_add_feature(model,
+                                    critic,
+                                    critic_mse,
+                                    seqs_x,
+                                    seqs_y,
+                                    lm_ids,
+                                    hter_label,
+                                    align_line,
+                                    eval=False,
+                                    normalization=1.0,
+                                    norm_by_words=False,
+                                    return_hter_pre=False,
+                                    ):
+
+    y_inp = seqs_y[:, :].contiguous()
+    y_label = lm_ids[:, 2:-1].contiguous()
+    words_norm = y_label.ne(Constants.PAD).float().sum(1)
+
+    x_len = seqs_x.size(-1) - 2
+    y_len = seqs_y.size(-1) - 3
+
+    align_matrix = torch.zeros([y_len, x_len])
+
+    for i in range(y_len):
+        if str(i) in align_line:
+            align_matrix[i] = align_matrix[i].index_fill(0, torch.tensor(align_line[str(i)]), True)
+
+    align_matrix_pad = F.pad(align_matrix, pad = (1, 1, 2, 1)).cuda()
+    if not eval:
+        model.train()
+        critic.train()
+        # For training
+        with torch.enable_grad():
+            log_probs, hter_pre = model(seqs_x, y_inp, align_matrix_pad = align_matrix_pad, add_feature = True)  #model返回tag和hter分别需要的部分
+            loss = critic(inputs=log_probs, labels=y_label, reduce=False, normalization=normalization)
+            loss_hter = critic_mse(hter_pre, hter_label)
+
+            if norm_by_words:
+                loss = loss.div(words_norm).sum()
+            else:
+                loss = loss.sum()
+
+        torch.autograd.backward(loss + loss_hter, retain_graph=True)  # backward的就是两个loss加一起
+        if return_hter_pre == True:
+            return loss.item(), loss_hter.item(), hter_pre
+        return loss.item(), loss_hter.item()
+    else:
+        model.eval()
+        critic.eval()
+        # For compute loss
+        with torch.no_grad():
+            log_probs, hter_pre = model(seqs_x, y_inp, align_matrix_pad = align_matrix_pad, add_feature = True)
+            loss = critic(inputs=log_probs, labels=y_label, normalization=normalization, reduce=True)
+            loss_hter = critic_mse(hter_pre, hter_label)
+
+        return loss.item(), loss_hter.item(), log_probs, hter_pre
+
+
+def compute_forward_discriminator_align_v4(model,
+                                            critic,
+                                            critic_mse,
+                                            seqs_x,
+                                            seqs_y,
+                                            lm_ids,
+                                            hter_label,
+                                            align_line,
+                                            eval=False,
+                                            normalization=1.0,
+                                            norm_by_words=False,
+                                            return_hter_pre=False,
+                                            attn_align_lambda=0.5,
+                                            ):
+
+    y_inp = seqs_y[:, :].contiguous()
+    y_label = lm_ids[:, 2:-1].contiguous()
+    words_norm = y_label.ne(Constants.PAD).float().sum(1)
+
+    if not eval:
+        model.train()
+        critic.train()
+        x_len = seqs_x.size(-1) - 2
+        y_len = seqs_y.size(-1) - 3
+        align_matrix = torch.zeros([y_len, x_len])
+
+        for i in range(y_len):
+            if str(i) in align_line:
+                align_matrix[i] = align_matrix[i].index_fill(0, torch.tensor(align_line[str(i)]), True)
+
+        align_matrix = align_matrix.cuda()
+        # For training
+        with torch.enable_grad():
+            log_probs, hter_pre, ctx_attn = model(seqs_x, y_inp, return_attn = True)  #model返回tag和hter分别需要的部分
+
+            # ctx_attn 一个列表，包括所有layer的attn: [batch_size, head_num, query_len, key_len]
+            ctx_attn_all = torch.stack(ctx_attn, dim = 1) # [batch_size, layer_num, head_num, query_len, key_len]
+            
+            # 选择前两个attn head，作为对齐训练attn
+            ctx_attn_align_head = ctx_attn_all[:, :, 0:4, 2:-1, 1:-1].squeeze(0)   # 去掉无关部分，<bos><eos> 这里把hter也去掉了，可能会有影响？
+            ctx_attn_align = ctx_attn_align_head.reshape(-1, y_len, x_len)   # [layer_num * choosed_head_num, seq_y, seq_x]
+            
+            align_matrix_repeat = align_matrix.repeat(ctx_attn_align.size(0), 1, 1)
+            
+            kl_loss = F.kl_div(ctx_attn_align.softmax(dim=-1).log(), align_matrix_repeat.softmax(dim=-1), reduction='sum') / ctx_attn_align.size(0)
+            
+            loss = critic(inputs=log_probs, labels=y_label, reduce=False, normalization=normalization)
+            loss_hter = critic_mse(hter_pre, hter_label)
+
+            if norm_by_words:
+                loss = loss.div(words_norm).sum()
+            else:
+                loss = loss.sum()
+
+        torch.autograd.backward((1 - attn_align_lambda) * (loss + loss_hter) + attn_align_lambda * kl_loss, retain_graph=True)  # backward的就是两个loss加一起
+        if return_hter_pre == True:
+            return loss.item(), loss_hter.item(), hter_pre
+        return loss.item(), loss_hter.item(), kl_loss.item()
+    else:
+        model.eval()
+        critic.eval()
+        # For compute loss
+        with torch.no_grad():
+            log_probs, hter_pre = model(seqs_x, y_inp)
+            loss = critic(inputs=log_probs, labels=y_label, normalization=normalization, reduce=True)
+            loss_hter = critic_mse(hter_pre, hter_label)
+
+        return loss.item(), loss_hter.item(), log_probs, hter_pre
+
+
+def compute_attn_align_cossim(model,
+                            seqs_x,
+                            seqs_y,
+                            lm_ids,
+                            hter_label,
+                            align_line,
+                            ):
+    # 计算attn 不同层不同head 和对齐矩阵的cosine相似度
+
+    y_inp = seqs_y[:, :].contiguous()
+    y_label = lm_ids[:, 2:-1].contiguous()
+    words_norm = y_label.ne(Constants.PAD).float().sum(1)
+
+    x_len = seqs_x.size(-1) - 2
+    y_len = seqs_y.size(-1) - 3
+
+    align_matrix = torch.zeros([y_len, x_len])
+
+    for i in range(y_len):
+        if str(i) in align_line:
+            align_matrix[i] = align_matrix[i].index_fill(0, torch.tensor(align_line[str(i)]), True)
+
+    align_matrix = align_matrix.cuda()
+
+    cos = nn.CosineSimilarity(dim=-1)
+
+    model.eval()
+    with torch.no_grad():
+        log_probs, hter_pre, ctx_attn = model(seqs_x, y_inp, return_attn = True)  #model返回tag和hter分别需要的部分
+
+        ctx_attn_all = torch.stack(ctx_attn, dim = 1)  # [batch_size, layer_num, head_num, seq_y_len + 3, seq_x_len + 2]
+        ctx_attn_real = ctx_attn_all[:, :, :, 2:-1, 1:-1]  # 去掉无关部分，<bos><eos> 这里把hter也去掉了
+        
+        align_matrix_repeat = align_matrix.repeat(ctx_attn_real.size(0), 1, 1).softmax(dim = -1)  # [batch_size, seq_y_len + 3, seq_x_len + 2]
+        
+        attn_align_cossim_one_sample = torch.zeros([ctx_attn_real.size(1), ctx_attn_real.size(2)])  # [layer_num, head_num]
+
+        for layer_id in range(ctx_attn_real.size(1)):
+            for head_id in range(ctx_attn_real.size(2)):
+                ctx_attn_this = ctx_attn_real[:, layer_id, head_id, :, :]  # [batch_size, seq_y_len + 3, seq_x_len + 2]
+                similarity = cos(ctx_attn_this, align_matrix_repeat)   # [batch_size, seq_y_len + 3]
+                attn_align_cossim_one_sample[layer_id, head_id] = similarity.mean()
+
+        return attn_align_cossim_one_sample
 
 
 def compute_forward_discriminator_contrastive(model,
@@ -992,11 +1393,17 @@ def compute_forward_discriminator_contrastive_src(model,
         critic.train()
         # For training
         with torch.enable_grad():
-            log_probs, hter_pre, dec_output = model(seqs_x, y_inp, get_result_and_representation=True)      # 修改src的伪数据
-            parallel_log_probs, parallel_hter_pre, parallel_dec_output = model(seqs_x_real, y_inp, get_result_and_representation=True)  # 正常src的平行语料
-            loss = critic(inputs=log_probs, labels=y_label, reduce=False, normalization=normalization)      # 伪数据词级别loss
+            # 修改src的伪数据
+            log_probs, hter_pre, dec_output = model(seqs_x, y_inp, get_result_and_representation=True)      
+            # 正常src的平行语料
+            parallel_log_probs, parallel_hter_pre, parallel_dec_output = model(seqs_x_real, y_inp, get_result_and_representation=True)  
+            
+            # 伪数据词级别loss
+            loss = critic(inputs=log_probs, labels=y_label, reduce=False, normalization=normalization)      
+            # 平行语料词级别loss
             loss_parallel = critic(inputs=parallel_log_probs, labels=y_label_parallel, reduce=False, normalization=normalization)
-            loss_hter = critic_mse(hter_pre, hter_label)    # 伪数据句子级loss
+            # 伪数据句子级loss
+            loss_hter = critic_mse(hter_pre, hter_label)    
 
             if norm_by_words:
                 loss = loss.div(words_norm).sum()
@@ -1039,25 +1446,79 @@ def compute_forward_discriminator_contrastive_src(model,
         return loss.item(), loss_parallel.item(), cl_loss.item(), loss_hter.item(), log_probs, hter_pre
 
 
-def compute_forward_discriminator_many(model,
+def cal_contrast_group(model,
+                        dataset,
+                        critic,
+                        critic_mse,
+                        ):
+    ss = 0
+    right = 0
+
+    for batch in dataset:
+        seqs_x, seqs_y, xy_label, xy_hter, _, contrast_idx = batch
+
+        x, y, xy_label = prepare_data_qe(seqs_x, seqs_y, xy_label, cuda=Constants.USE_GPU)
+            
+        if Constants.USE_GPU:
+            xy_hter = torch.tensor(xy_hter).cuda()
+            contrast_idx = torch.tensor(contrast_idx).cuda().int().squeeze(0).squeeze(0)
+        #print('contrast_idx')
+        #print(contrast_idx)
+        token_mask = torch.zeros_like(xy_label)[:, 2:-1]
+        for idx in contrast_idx:
+            token_mask[0, idx] = 1
+
+        loss, loss_hter, logits, hter_pre = compute_forward_discriminator_token_mask(model=model,
+                                                                            critic=critic,
+                                                                            critic_mse=critic_mse,
+                                                                            seqs_x=x,
+                                                                            seqs_y=y,
+                                                                            lm_ids=xy_label,
+                                                                            hter_label=xy_hter,
+                                                                            token_mask=token_mask,
+                                                                            eval=True)
+        xy_label = (xy_label[:, 2:-1].contiguous() * token_mask).view(-1).cpu().tolist()
+        logits = logits.view(-1, 3).cpu().tolist()
+
+        for e_l, e_o in zip(xy_label, logits):
+            if e_l == 0:
+                continue
+            # label里是1和2。
+            # 1原词，2噪声。
+            if e_o[1] < e_o[2]:
+                e_o = 2
+            else:
+                e_o = 1
+            if e_o == e_l:
+                right += 1
+            ss += 1
+    
+    if ss == 0:
+        return 1
+
+    return float(right / ss)
+
+
+def compute_forward_discriminator_token_mask(model,
                                   critic,
                                   critic_mse,
                                   seqs_x,
                                   seqs_y,
                                   lm_ids,
                                   hter_label,
-                                  many_mask,
+                                  token_mask = None,
                                   eval=False,
                                   normalization=1.0,
                                   norm_by_words=False,
                                   return_hter_pre=False,
+                                  margin=False,
                                   ):
     """
-    只考虑训练样本数量高于一定阈值的token，
+    只考虑训练样本中没被mask的token
     """
     y_inp = seqs_y[:, :].contiguous()
     y_label = lm_ids[:, 2:-1].contiguous()
-    y_label *= many_mask
+    if token_mask is not None: y_label *= token_mask
     words_norm = y_label.ne(Constants.PAD).float().sum(1)
 
     if not eval:
@@ -1065,9 +1526,151 @@ def compute_forward_discriminator_many(model,
         critic.train()
         # For training
         with torch.enable_grad():
-            log_probs, hter_pre = model(seqs_x, y_inp)  #model返回tag和hter分别需要的部分
+            log_probs, hter_pre = model(seqs_x, y_inp, margin_loss=margin)  #model返回tag和hter分别需要的部分
 
-            # 这里传回来的loss就已经是 仅限于训练样本高于一定阈值的loss了
+            # 这里传回来的loss就已经是 仅限于训练样本中没被mask的token的loss了
+
+            loss = critic(inputs=log_probs, labels=y_label, reduce=False, normalization=normalization)
+
+            loss_hter = critic_mse(hter_pre, hter_label)
+
+            if norm_by_words:
+                loss = loss.div(words_norm).sum()
+            else:
+                loss = loss.sum()
+
+        # TODO 冻结参数debug
+        loss.requires_grad_(True)
+        loss_hter.requires_grad_(True)
+        torch.autograd.backward(loss + loss_hter, retain_graph=True)  # backward的就是两个loss加一起
+        #torch.autograd.backward(loss, retain_graph=True) # 只用token_loss更新梯度
+        if return_hter_pre == True:
+            return loss.item(), loss_hter.item(), hter_pre
+        return loss.item(), loss_hter.item()
+    else:
+        model.eval()
+        critic.eval()
+        # For compute loss
+        with torch.no_grad():
+            log_probs, hter_pre = model(seqs_x, y_inp, margin_loss=margin)
+            loss = critic(inputs=log_probs, labels=y_label, normalization=normalization, reduce=True)
+            loss_hter = critic_mse(hter_pre, hter_label)
+
+        return loss.item(), loss_hter.item(), log_probs, hter_pre
+
+
+def compute_forward_discriminator_token_mask_add_feature(model,
+                                                critic,
+                                                critic_mse,
+                                                seqs_x,
+                                                seqs_y,
+                                                lm_ids,
+                                                hter_label,
+                                                align_line,
+                                                token_mask = None,
+                                                eval=False,
+                                                normalization=1.0,
+                                                norm_by_words=False,
+                                                return_hter_pre=False,
+                                                margin=False,
+                                                ):
+    """
+    只考虑训练样本中没被mask的token
+    """
+    y_inp = seqs_y[:, :].contiguous()
+    y_label = lm_ids[:, 2:-1].contiguous()
+    if token_mask is not None: y_label *= token_mask
+    words_norm = y_label.ne(Constants.PAD).float().sum(1)
+
+    x_len = seqs_x.size(-1) - 2
+    y_len = seqs_y.size(-1) - 3
+
+    align_matrix = torch.zeros([y_len, x_len])
+
+    for i in range(y_len):
+        if str(i) in align_line:
+            align_matrix[i] = align_matrix[i].index_fill(0, torch.tensor(align_line[str(i)]), True)
+
+    align_matrix_pad = F.pad(align_matrix, pad = (1, 1, 2, 1)).cuda()
+
+    if not eval:
+        model.train()
+        critic.train()
+        # For training
+        with torch.enable_grad():
+            log_probs, hter_pre = model(seqs_x, y_inp, margin_loss=margin, align_matrix_pad = align_matrix_pad, add_feature = True)  #model返回tag和hter分别需要的部分
+
+            # 这里传回来的loss就已经是 仅限于训练样本中没被mask的token的loss了
+            loss = critic(inputs=log_probs, labels=y_label, reduce=False, normalization=normalization)
+            loss_hter = critic_mse(hter_pre, hter_label)
+
+            if norm_by_words:
+                loss = loss.div(words_norm).sum()
+            else:
+                loss = loss.sum()
+
+        # TODO 冻结参数debug
+        loss.requires_grad_(True)
+        loss_hter.requires_grad_(True)
+        torch.autograd.backward(loss + loss_hter, retain_graph=True)  # backward的就是两个loss加一起
+        #torch.autograd.backward(loss, retain_graph=True) # 只用token_loss更新梯度
+        if return_hter_pre == True:
+            return loss.item(), loss_hter.item(), hter_pre
+        return loss.item(), loss_hter.item()
+    else:
+        model.eval()
+        critic.eval()
+        # For compute loss
+        with torch.no_grad():
+            log_probs, hter_pre = model(seqs_x, y_inp, margin_loss=margin, align_matrix_pad = align_matrix_pad, add_feature = True)
+            loss = critic(inputs=log_probs, labels=y_label, normalization=normalization, reduce=True)
+            loss_hter = critic_mse(hter_pre, hter_label)
+
+        return loss.item(), loss_hter.item(), log_probs, hter_pre
+
+
+def compute_forward_discriminator_token_mask_align_v1(model,
+                                  critic,
+                                  critic_mse,
+                                  seqs_x,
+                                  seqs_y,
+                                  lm_ids,
+                                  hter_label,
+                                  align_line,
+                                  token_mask = None,
+                                  eval=False,
+                                  normalization=1.0,
+                                  norm_by_words=False,
+                                  return_hter_pre=False,
+                                  ):
+    """
+    只考虑训练样本中没被mask的token
+    而且融入对齐信息
+    """
+    y_inp = seqs_y[:, :].contiguous()
+    y_label = lm_ids[:, 2:-1].contiguous()
+    if token_mask is not None: y_label *= token_mask
+    words_norm = y_label.ne(Constants.PAD).float().sum(1)
+
+    x_len = seqs_x.size(-1) - 2
+    y_len = seqs_y.size(-1) - 3
+
+    align_matrix = torch.zeros([y_len, x_len])
+
+    for i in range(y_len):
+        if str(i) in align_line:
+            align_matrix[i] = align_matrix[i].index_fill(0, torch.tensor(align_line[str(i)]), True)
+
+    align_matrix_pad = F.pad(align_matrix, pad = (1, 1, 2, 1)).cuda()
+
+    if not eval:
+        model.train()
+        critic.train()
+        # For training
+        with torch.enable_grad():
+            log_probs, hter_pre = model(seqs_x, y_inp, align_matrix_pad = align_matrix_pad, requires_adapter=False)  #model返回tag和hter分别需要的部分
+
+            # 这里传回来的loss就已经是 仅限于训练样本中没被mask的token的loss了
             loss = critic(inputs=log_probs, labels=y_label, reduce=False, normalization=normalization)
             #print(loss)
             #assert 1==2
@@ -1078,8 +1681,11 @@ def compute_forward_discriminator_many(model,
             else:
                 loss = loss.sum()
 
-        #torch.autograd.backward(loss + loss_hter, retain_graph=True)  # backward的就是两个loss加一起
-        torch.autograd.backward(loss, retain_graph=True) # 只用token_loss更新梯度
+        # TODO 冻结参数debug
+        loss.requires_grad_(True)
+        loss_hter.requires_grad_(True)
+        torch.autograd.backward(loss + loss_hter, retain_graph=True)  # backward的就是两个loss加一起
+        #torch.autograd.backward(loss, retain_graph=True) # 只用token_loss更新梯度
         if return_hter_pre == True:
             return loss.item(), loss_hter.item(), hter_pre
         return loss.item(), loss_hter.item()
@@ -1088,7 +1694,7 @@ def compute_forward_discriminator_many(model,
         critic.eval()
         # For compute loss
         with torch.no_grad():
-            log_probs, hter_pre = model(seqs_x, y_inp)
+            log_probs, hter_pre = model(seqs_x, y_inp, align_matrix_pad = align_matrix_pad, requires_adapter=False)
             loss = critic(inputs=log_probs, labels=y_label, normalization=normalization, reduce=True)
             loss_hter = critic_mse(hter_pre, hter_label)
 
@@ -3022,6 +3628,45 @@ def plot_attribution1(train_influence_saliency, plot_path_prefix, \
     plt.savefig(plot_path_prefix + "infl_test_{}_{}_train_{}_{}.jpg".format(test_id, test_token_id, rank, train_id))
 
 
+def plot_attribution_src(attr_token_src, 
+                        plot_path_prefix, mt_tokens, src_tokens, mt_dict, src_dict, 
+                        id, gradients_type, lang='enzh'):
+    # 每个样本生成6张attribution图
+
+    if lang == 'enzh':
+        # 支持中文
+        plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
+        plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
+
+    if lang == 'ende':
+        font = {'family': 'serif'}
+        matplotlib.rc('font', **font) 
+
+    mt_tokens = mt_tokens.cpu().detach().numpy().tolist()
+    mt_sent = [mt_dict.id2token(w) for w in mt_tokens]
+    src_tokens = src_tokens.cpu().detach().numpy().tolist()
+    src_sent = [src_dict.id2token(w) for w in src_tokens]
+    mt_sent_len = len(mt_sent)
+    src_sent_len = len(src_sent)
+    mt_font_size = 240 // mt_sent_len
+    src_font_size = 240 // src_sent_len
+    srcmt_sent = src_sent + mt_sent
+    srcmt_sent_len = len(srcmt_sent)
+    srcmt_font_size = 240 // srcmt_sent_len
+    
+    # 4.attr_token_src: 每个src token对每个token标签预测的贡献
+    attr_token_src = attr_token_src.cpu().detach().numpy()     # [src_len, mt_len]
+    f, ax = plt.subplots(figsize = (30,30))
+    sns.heatmap(attr_token_src, ax=ax, cmap="YlGnBu", square=True, annot=attr_token_src, cbar=False, \
+        annot_kws={'size':src_font_size}, fmt='.4f')
+    ax.set_xlabel('attribution', fontsize=src_font_size)
+    ax.set_xticklabels(mt_sent,rotation=0)
+    ax.set_yticklabels(src_sent,rotation=0)
+    plt.tick_params(labelsize=src_font_size)
+    plt.savefig(plot_path_prefix + "attr_{}_token_src_{}.jpg".format(gradients_type, id))
+
+
+
 def plot_attribution_all(attr_sent_mt, attr_token_mt, attr_sent_src, attr_token_src, 
                         attr_sent_srcmt, attr_token_srcmt,
                         plot_path_prefix, mt_tokens, src_tokens, mt_dict, src_dict, 
@@ -3171,7 +3816,7 @@ def loss_evaluation(model, critic, valid_iterator, LM=None, rank=0, world_size=1
     return float(sum_loss / n_sents), acc
 
 
-def loss_evaluation_qe(discriminator, critic, critic_mse, valid_iterator):
+def loss_evaluation_qe_origin(discriminator, critic, critic_mse, valid_iterator):
 
     n_sents = 0
     sum_loss = 0.0
@@ -3263,7 +3908,285 @@ def loss_evaluation_qe(discriminator, critic, critic_mse, valid_iterator):
     return float(sum_loss / n_sents), float(sum_loss_hter / n_sents), f1_good, f1_bad, f1_bad * f1_good, p
 
 
-def loss_evaluation_qe_align(discriminator, critic, critic_mse, valid_iterator, align_dict):
+def loss_evaluation_qe(discriminator, critic, critic_mse, valid_iterator, requires_adapter=False):
+
+    n_sents = 0
+    sum_loss = 0.0
+    sum_loss_hter = 0.0
+    valid_iter = valid_iterator.build_generator()
+
+    TP = 0 + 1e-12
+    FP = 0 + 1e-12
+    FN = 0 + 1e-12
+    TN = 0 + 1e-12
+    #print("====in loss evaluation qe=========")
+    total_hters = []
+    total_hter_gold = []
+    #ii = 0
+    for batch in valid_iter:
+        seqs_x, seqs_y, xy_label, xy_hter = batch
+        n_sents += len(seqs_x)
+
+        x, y, xy_label = prepare_data_qe(seqs_x, seqs_y, xy_label, cuda=Constants.USE_GPU)
+        if Constants.USE_GPU:
+            xy_hter = torch.tensor(xy_hter)
+            xy_hter = xy_hter.cuda()
+        """
+        print('------- one batch')
+        print(x.size())
+        print(y.size())
+        print(xy_label.size())
+        print(xy_hter.size())
+        """
+        #print(ii)
+        loss, loss_hter, logits, hter_pre = compute_forward_discriminator(model=discriminator,
+                                                                          critic=critic,
+                                                                          critic_mse=critic_mse,
+                                                                          seqs_x=x,
+                                                                          seqs_y=y,
+                                                                          lm_ids=xy_label,
+                                                                          hter_label=xy_hter,
+                                                                          eval=True,
+                                                                          requires_adapter=requires_adapter)
+        #print(loss)
+        #print(loss_hter)
+        hter_pre = hter_pre.view(-1).cpu().tolist()
+        xy_hter = xy_hter.view(-1).cpu().tolist()
+        for each in hter_pre:
+            total_hters.append(each)
+        for each in xy_hter:
+            total_hter_gold.append(each)
+
+        logits = logits.view(-1, 3).cpu().tolist()
+        xy_label = xy_label[:, 2:-1].contiguous().view(-1).cpu().tolist()
+
+        for e_l, e_o in zip(xy_label, logits):
+            if e_l == 0:
+                continue
+            # label里是1和2。
+            # 1原词，2噪声。
+            if e_o[1] < e_o[2]:
+                e_o = 2
+            else:
+                e_o = 1
+            if e_o == e_l:
+                if e_o == 1:
+                    TP += 1
+                else:
+                    TN += 1
+            else:
+                if e_o == 1:
+                    FP += 1
+                else:
+                    FN += 1
+
+        if np.isnan(loss):
+            WARN("NaN detected!")
+        if np.isnan(loss_hter):
+            WARN("NaN detected!")
+
+        sum_loss += float(loss)
+        sum_loss_hter += float(loss_hter)
+        #ii += 1
+        #if ii>=2: break
+
+    precsion_1 = TP / (TP + FP)
+    recall_1 = TP / (TP + FN)
+    precsion_2 = TN / (FN + TN)
+    recall_2 = TN / (FP + TN)
+    f1_good = 2 * precsion_1 * recall_1 / (precsion_1 + recall_1)
+    f1_bad = 2 * precsion_2 * recall_2 / (precsion_2 + recall_2)
+    p = pearsonr(total_hters, total_hter_gold)[0]
+    #print("====out of loss evaluation qe=========")
+    return float(sum_loss / n_sents), float(sum_loss_hter / n_sents), f1_good, f1_bad, f1_bad * f1_good, p
+
+
+def loss_evaluation_qe_margin(discriminator, critic, critic_mse, valid_iterator, requires_adapter=False):
+
+    n_sents = 0
+    sum_loss = 0.0
+    sum_loss_hter = 0.0
+    valid_iter = valid_iterator.build_generator()
+
+    TP = 0 + 1e-12
+    FP = 0 + 1e-12
+    FN = 0 + 1e-12
+    TN = 0 + 1e-12
+    #print("====in loss evaluation qe=========")
+    total_hters = []
+    total_hter_gold = []
+    #ii = 0
+    for batch in valid_iter:
+        seqs_x, seqs_y, xy_label, xy_hter = batch
+        n_sents += len(seqs_x)
+
+        x, y, xy_label = prepare_data_qe(seqs_x, seqs_y, xy_label, cuda=Constants.USE_GPU)
+        if Constants.USE_GPU:
+            xy_hter = torch.tensor(xy_hter)
+            xy_hter = xy_hter.cuda()
+        """
+        print('------- one batch')
+        print(x.size())
+        print(y.size())
+        print(xy_label.size())
+        print(xy_hter.size())
+        """
+        #print(ii)
+        loss, loss_hter, logits, hter_pre = compute_forward_discriminator_margin(model=discriminator,
+                                                                          critic=critic,
+                                                                          critic_mse=critic_mse,
+                                                                          seqs_x=x,
+                                                                          seqs_y=y,
+                                                                          lm_ids=xy_label,
+                                                                          hter_label=xy_hter,
+                                                                          eval=True,)
+        #print(loss)
+        #print(loss_hter)
+        hter_pre = hter_pre.view(-1).cpu().tolist()
+        xy_hter = xy_hter.view(-1).cpu().tolist()
+        for each in hter_pre:
+            total_hters.append(each)
+        for each in xy_hter:
+            total_hter_gold.append(each)
+
+        logits = logits.view(-1, 3).cpu().tolist()
+        xy_label = xy_label[:, 2:-1].contiguous().view(-1).cpu().tolist()
+
+        for e_l, e_o in zip(xy_label, logits):
+            if e_l == 0:
+                continue
+            # label里是1和2。
+            # 1原词，2噪声。
+            if e_o[1] < e_o[2]:
+                e_o = 2
+            else:
+                e_o = 1
+            if e_o == e_l:
+                if e_o == 1:
+                    TP += 1
+                else:
+                    TN += 1
+            else:
+                if e_o == 1:
+                    FP += 1
+                else:
+                    FN += 1
+
+        if np.isnan(loss):
+            WARN("NaN detected!")
+        if np.isnan(loss_hter):
+            WARN("NaN detected!")
+
+        sum_loss += float(loss)
+        sum_loss_hter += float(loss_hter)
+        #ii += 1
+        #if ii>=2: break
+
+    precsion_1 = TP / (TP + FP)
+    recall_1 = TP / (TP + FN)
+    precsion_2 = TN / (FN + TN)
+    recall_2 = TN / (FP + TN)
+    f1_good = 2 * precsion_1 * recall_1 / (precsion_1 + recall_1)
+    f1_bad = 2 * precsion_2 * recall_2 / (precsion_2 + recall_2)
+    p = pearsonr(total_hters, total_hter_gold)[0]
+    #print("====out of loss evaluation qe=========")
+    return float(sum_loss / n_sents), float(sum_loss_hter / n_sents), f1_good, f1_bad, f1_bad * f1_good, p
+
+
+def loss_evaluation_qe_one_class(discriminator, critic, critic_mse, valid_iterator, no_sigmoid=False):
+
+    n_sents = 0
+    sum_loss = 0.0
+    sum_loss_hter = 0.0
+    valid_iter = valid_iterator.build_generator()
+
+    TP = 0 + 1e-12
+    FP = 0 + 1e-12
+    FN = 0 + 1e-12
+    TN = 0 + 1e-12
+    #print("====in loss evaluation qe=========")
+    total_hters = []
+    total_hter_gold = []
+    #ii = 0
+    for batch in valid_iter:
+        seqs_x, seqs_y, xy_label, xy_hter = batch
+        n_sents += len(seqs_x)
+
+        x, y, xy_label = prepare_data_qe(seqs_x, seqs_y, xy_label, cuda=Constants.USE_GPU)
+        if Constants.USE_GPU:
+            xy_hter = torch.tensor(xy_hter)
+            xy_hter = xy_hter.cuda()
+        """
+        print('------- one batch')
+        print(x.size())
+        print(y.size())
+        print(xy_label.size())
+        print(xy_hter.size())
+        """
+        #print(ii)
+        loss, loss_hter, logits, hter_pre = compute_forward_discriminator_one_class(model=discriminator,
+                                                                          critic=critic,
+                                                                          critic_mse=critic_mse,
+                                                                          seqs_x=x,
+                                                                          seqs_y=y,
+                                                                          lm_ids=xy_label,
+                                                                          hter_label=xy_hter,
+                                                                          eval=True,
+                                                                          no_sigmoid=no_sigmoid)
+        #print(loss)
+        #print(loss_hter)
+        hter_pre = hter_pre.view(-1).cpu().tolist()
+        xy_hter = xy_hter.view(-1).cpu().tolist()
+        for each in hter_pre:
+            total_hters.append(each)
+        for each in xy_hter:
+            total_hter_gold.append(each)
+
+        logits = logits.view(-1).cpu().tolist()
+        xy_label = xy_label[:, 2:-1].contiguous().view(-1).cpu().tolist()
+
+        for e_l, e_o in zip(xy_label, logits):
+            if e_l == 0:
+                continue
+            # label里是1和2。
+            # 1原词，2噪声。
+            if e_o >= 0.5:
+                e_o = 1
+            else:
+                e_o = 2
+            if e_o == e_l:
+                if e_o == 1:
+                    TP += 1
+                else:
+                    TN += 1
+            else:
+                if e_o == 1:
+                    FP += 1
+                else:
+                    FN += 1
+
+        if np.isnan(loss):
+            WARN("NaN detected!")
+        if np.isnan(loss_hter):
+            WARN("NaN detected!")
+
+        sum_loss += float(loss)
+        sum_loss_hter += float(loss_hter)
+        #ii += 1
+        #if ii>=2: break
+
+    precsion_1 = TP / (TP + FP)
+    recall_1 = TP / (TP + FN)
+    precsion_2 = TN / (FN + TN)
+    recall_2 = TN / (FP + TN)
+    f1_good = 2 * precsion_1 * recall_1 / (precsion_1 + recall_1)
+    f1_bad = 2 * precsion_2 * recall_2 / (precsion_2 + recall_2)
+    p = pearsonr(total_hters, total_hter_gold)[0]
+    #print("====out of loss evaluation qe=========")
+    return float(sum_loss / n_sents), float(sum_loss_hter / n_sents), f1_good, f1_bad, f1_bad * f1_good, p
+
+
+def loss_evaluation_qe_align_v1(discriminator, critic, critic_mse, valid_iterator, align_dict, align_ratio=0.5):
 
     n_sents = 0
     sum_loss = 0.0
@@ -3298,6 +4221,7 @@ def loss_evaluation_qe_align(discriminator, critic, critic_mse, valid_iterator, 
                                                                             lm_ids=xy_label,
                                                                             hter_label=xy_hter,
                                                                             align_line=align_line,
+                                                                            align_ratio=align_ratio,
                                                                             eval=True)
         #print(loss)
         #print(loss_hter)
@@ -3349,6 +4273,183 @@ def loss_evaluation_qe_align(discriminator, critic, critic_mse, valid_iterator, 
     f1_bad = 2 * precsion_2 * recall_2 / (precsion_2 + recall_2)
     p = pearsonr(total_hters, total_hter_gold)[0]
     #print("====out of loss evaluation qe=========")
+    return float(sum_loss / n_sents), float(sum_loss_hter / n_sents), f1_good, f1_bad, f1_bad * f1_good, p
+
+
+def loss_evaluation_qe_align_v3(discriminator, critic, critic_mse, valid_iterator, align_dict, attn_align_lambda=0):
+
+    n_sents = 0
+    sum_loss = 0.0
+    sum_loss_hter = 0.0
+    valid_iter = valid_iterator.build_generator()
+
+    TP = 0 + 1e-12
+    FP = 0 + 1e-12
+    FN = 0 + 1e-12
+    TN = 0 + 1e-12
+    #print("====in loss evaluation qe=========")
+    total_hters = []
+    total_hter_gold = []
+
+    id = 0
+    for batch in valid_iter:
+        seqs_x, seqs_y, xy_label, xy_hter = batch
+        n_sents += len(seqs_x)
+
+        align_line = align_dict[str(id)]
+
+        x, y, xy_label = prepare_data_qe(seqs_x, seqs_y, xy_label, cuda=Constants.USE_GPU)
+        if Constants.USE_GPU:
+            xy_hter = torch.tensor(xy_hter)
+            xy_hter = xy_hter.cuda()
+
+        loss, loss_hter, logits, hter_pre = compute_forward_discriminator_align_v3(model=discriminator,
+                                                                            critic=critic,
+                                                                            critic_mse=critic_mse,
+                                                                            seqs_x=x,
+                                                                            seqs_y=y,
+                                                                            lm_ids=xy_label,
+                                                                            hter_label=xy_hter,
+                                                                            align_line=align_line,
+                                                                            attn_align_lambda=attn_align_lambda,
+                                                                            eval=True)
+        #print(loss)
+        #print(loss_hter)
+        hter_pre = hter_pre.view(-1).cpu().tolist()
+        xy_hter = xy_hter.view(-1).cpu().tolist()
+        for each in hter_pre:
+            total_hters.append(each)
+        for each in xy_hter:
+            total_hter_gold.append(each)
+
+        logits = logits.view(-1, 3).cpu().tolist()
+        xy_label = xy_label[:, 2:-1].contiguous().view(-1).cpu().tolist()
+
+        for e_l, e_o in zip(xy_label, logits):
+            if e_l == 0:
+                continue
+            # label里是1和2。
+            # 1原词，2噪声。
+            if e_o[1] < e_o[2]:
+                e_o = 2
+            else:
+                e_o = 1
+            if e_o == e_l:
+                if e_o == 1:
+                    TP += 1
+                else:
+                    TN += 1
+            else:
+                if e_o == 1:
+                    FP += 1
+                else:
+                    FN += 1
+
+        if np.isnan(loss):
+            WARN("NaN detected!")
+        if np.isnan(loss_hter):
+            WARN("NaN detected!")
+
+        sum_loss += float(loss)
+        sum_loss_hter += float(loss_hter)
+        id += 1
+        #if ii>=2: break
+
+    precsion_1 = TP / (TP + FP)
+    recall_1 = TP / (TP + FN)
+    precsion_2 = TN / (FN + TN)
+    recall_2 = TN / (FP + TN)
+    f1_good = 2 * precsion_1 * recall_1 / (precsion_1 + recall_1)
+    f1_bad = 2 * precsion_2 * recall_2 / (precsion_2 + recall_2)
+    p = pearsonr(total_hters, total_hter_gold)[0]
+    #print("====out of loss evaluation qe=========")
+    return float(sum_loss / n_sents), float(sum_loss_hter / n_sents), f1_good, f1_bad, f1_bad * f1_good, p
+
+
+def loss_evaluation_qe_add_feature(discriminator, critic, critic_mse, valid_iterator, align_dict, ):
+
+    n_sents = 0
+    sum_loss = 0.0
+    sum_loss_hter = 0.0
+    valid_iter = valid_iterator.build_generator()
+
+    TP = 0 + 1e-12
+    FP = 0 + 1e-12
+    FN = 0 + 1e-12
+    TN = 0 + 1e-12
+    #print("====in loss evaluation qe=========")
+    total_hters = []
+    total_hter_gold = []
+
+    id = 0
+    for batch in valid_iter:
+        seqs_x, seqs_y, xy_label, xy_hter = batch
+        n_sents += len(seqs_x)
+
+        align_line = align_dict[str(id)]
+
+        x, y, xy_label = prepare_data_qe(seqs_x, seqs_y, xy_label, cuda=Constants.USE_GPU)
+        if Constants.USE_GPU:
+            xy_hter = torch.tensor(xy_hter)
+            xy_hter = xy_hter.cuda()
+
+        loss, loss_hter, logits, hter_pre = compute_forward_discriminator_add_feature(model=discriminator,
+                                                                            critic=critic,
+                                                                            critic_mse=critic_mse,
+                                                                            seqs_x=x,
+                                                                            seqs_y=y,
+                                                                            lm_ids=xy_label,
+                                                                            hter_label=xy_hter,
+                                                                            align_line=align_line,
+                                                                            eval=True)
+
+        hter_pre = hter_pre.view(-1).cpu().tolist()
+        xy_hter = xy_hter.view(-1).cpu().tolist()
+        for each in hter_pre:
+            total_hters.append(each)
+        for each in xy_hter:
+            total_hter_gold.append(each)
+
+        logits = logits.view(-1, 3).cpu().tolist()
+        xy_label = xy_label[:, 2:-1].contiguous().view(-1).cpu().tolist()
+
+        for e_l, e_o in zip(xy_label, logits):
+            if e_l == 0:
+                continue
+            # label里是1和2。
+            # 1原词，2噪声。
+            if e_o[1] < e_o[2]:
+                e_o = 2
+            else:
+                e_o = 1
+            if e_o == e_l:
+                if e_o == 1:
+                    TP += 1
+                else:
+                    TN += 1
+            else:
+                if e_o == 1:
+                    FP += 1
+                else:
+                    FN += 1
+
+        if np.isnan(loss):
+            WARN("NaN detected!")
+        if np.isnan(loss_hter):
+            WARN("NaN detected!")
+
+        sum_loss += float(loss)
+        sum_loss_hter += float(loss_hter)
+        id += 1
+        #if ii>=2: break
+
+    precsion_1 = TP / (TP + FP)
+    recall_1 = TP / (TP + FN)
+    precsion_2 = TN / (FN + TN)
+    recall_2 = TN / (FP + TN)
+    f1_good = 2 * precsion_1 * recall_1 / (precsion_1 + recall_1)
+    f1_bad = 2 * precsion_2 * recall_2 / (precsion_2 + recall_2)
+    p = pearsonr(total_hters, total_hter_gold)[0]
     return float(sum_loss / n_sents), float(sum_loss_hter / n_sents), f1_good, f1_bad, f1_bad * f1_good, p
 
 
@@ -3768,14 +4869,14 @@ def loss_evaluation_qe_many(discriminator, critic, critic_mse, valid_iterator, t
             xy_hter = torch.tensor(xy_hter)
             xy_hter = xy_hter.cuda()
 
-        loss, loss_hter, logits, hter_pre = compute_forward_discriminator_many(model=discriminator,
+        loss, loss_hter, logits, hter_pre = compute_forward_discriminator_token_mask(model=discriminator,
                                                                           critic=critic,
                                                                           critic_mse=critic_mse,
                                                                           seqs_x=x,
                                                                           seqs_y=y,
                                                                           lm_ids=xy_label,
                                                                           hter_label=xy_hter,
-                                                                          many_mask=many_mask,
+                                                                          token_mask=many_mask,
                                                                           eval=True)
         #print(loss)
         #print(loss_hter)
@@ -6098,7 +7199,9 @@ def generate_robust(flags):
             with torch.no_grad():
                 mlm_logits_x = model(y, x_mask, 'MLM', log_probs=False)  # [batch_size, seq_len, hidden_dim]
             
-            word_noise_data_x, flag_change = gen_noise_data5_y2x_robust(x, mlm_logits_x, lm_ids_x)
+            # word_noise_data_x, flag_change = gen_noise_data5_y2x_robust(x, mlm_logits_x, lm_ids_x)
+            word_noise_data_x = gen_noise_data5_y2x_robust_must(x, mlm_logits_x, lm_ids_x)
+            flag_change = True
             if flag_change:
                 robust_idx_list_this = []
                 word_noise_label_y = xy_label[0][:]
@@ -7020,6 +8123,539 @@ def train_discriminator(flags):
                                            critic=critic,
                                            critic_mse=critic_mse,
                                            valid_iterator=valid_iterator)
+
+                    # 保存ckpt
+                    torch.save(discriminator.state_dict(), best_model_prefix + '.ckpt.' + str(uidx))
+                
+                if scheduler is not None and optimizer_configs["schedule_method"] == "loss":
+                    scheduler.step(metric=valid_loss)
+
+                model_collections.add_to_collection("history_loss", valid_loss)
+
+                min_valid_loss = np.array(model_collections.get_collection("history_loss")).min()
+
+                if summary_writer is not None:
+                    summary_writer.add_scalar("loss_word", valid_loss, global_step=uidx)
+                    summary_writer.add_scalar('loss_hter', valid_loss_hter, global_step=uidx)
+                    summary_writer.add_scalar('f1good', f1good, global_step=uidx)
+                    summary_writer.add_scalar('f1bad', f1bad, global_step=uidx)
+                    summary_writer.add_scalar('f1multi', f1multi, global_step=uidx)
+                    summary_writer.add_scalar('pearsonr', p, global_step=uidx)
+
+                if eidx >= 0:
+                    if valid_loss <= min_valid_loss:
+                        bad_count = 0
+                        if is_early_stop is False and rank == 0:
+                            INFO("save")
+                            torch.save(discriminator.state_dict(), best_model_prefix + '.final')
+                    else:
+                        bad_count += 1
+                        if bad_count >= training_configs['early_stop_patience']:
+                            is_early_stop = True
+                            WARN("Early Stop")
+
+                INFO("{0} Loss: {1:.2f} Loss_hter: {2:.6f} F1_good: {3:.4f} F1_bad: {4:.4f} "
+                     "F1_multi: {5:.4f} pearsonr:{6:.6f} patience: {7}".
+                     format(uidx, valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p, bad_count))
+    
+            if is_early_stop is True:
+                break
+            # ================================================================================== #
+        if training_progress_bar is not None:
+            training_progress_bar.close()
+
+        if is_early_stop is True:
+            break
+
+        eidx += 1
+        if eidx > training_configs["max_epochs"]:
+            break
+
+
+def train_discriminator_one_class(flags):
+    # 单分类替代多分类，词级别预测最后线性层映射到一维
+    """
+    flags:
+        saveto: str
+        reload: store_true
+        config_path: str
+        pretrain_path: str, default=""
+        model_name: str
+        log_path: str
+    """
+
+    # ================================================================================== #
+    # Initialization for training on different devices
+    # - CPU/GPU
+    # - Single/Distributed
+    Constants.USE_GPU = flags.use_gpu
+
+    if flags.multi_gpu:
+        dist.distributed_init(flags.shared_dir)
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        local_rank = dist.get_local_rank()
+    else:
+        world_size = 1
+        rank = 0
+        local_rank = 0
+
+    if Constants.USE_GPU:
+        torch.cuda.set_device(local_rank)
+        Constants.CURRENT_DEVICE = "cuda:{0}".format(local_rank)
+    else:
+        Constants.CURRENT_DEVICE = "cpu"
+
+    # If not root_rank, close logging
+    # else write log of training to file.
+    if rank == 0:
+        write_log_to_file(os.path.join(flags.log_path, "%s.log" % time.strftime("%Y%m%d-%H%M%S")))
+    else:
+        close_logging()
+
+    # ================================================================================== #
+    # Parsing configuration files
+    # - Load default settings
+    # - Load pre-defined settings
+    # - Load user-defined settings
+
+    configs = prepare_configs(flags.config_path, flags.predefined_config)
+
+    data_configs = configs['data_configs']
+    discriminator_configs = configs['discriminator_configs']
+    generator_configs = configs['generator_configs']
+    optimizer_configs = configs['optimizer_configs']
+    training_configs = configs['training_configs']
+
+    INFO(pretty_configs(configs))
+
+    Constants.SEED = training_configs['seed']
+
+    set_seed(Constants.SEED)
+
+    timer = Timer()
+
+    # ================================================================================== #
+    # Load Data
+
+    INFO('Loading data...')
+    timer.tic()
+
+    # Generate target dictionary
+    vocab_src = Vocabulary.build_from_file(**data_configs['vocabularies'][0])
+    vocab_tgt = Vocabulary.build_from_file(**data_configs['vocabularies'][1])
+
+    Constants.EOS = vocab_src.eos
+    Constants.PAD = vocab_src.pad
+    Constants.BOS = vocab_src.bos
+    Constants.MASK = vocab_src.mask
+
+    train_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['train_data'][0],
+                        vocabulary=vocab_src,
+                        max_len=data_configs['max_len'][0],
+                        ),
+        TextLineDataset(data_path=data_configs['train_data'][1],
+                        vocabulary=vocab_tgt,
+                        max_len=data_configs['max_len'][1],
+                        )
+    )
+
+    valid_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['valid_data'][0],
+                        vocabulary=vocab_src,
+                        ),
+        TextLineDataset(data_path=data_configs['valid_data'][1],
+                        vocabulary=vocab_tgt,
+                        ),
+        QETagsDataset(data_path=data_configs['valid_data'][2]),
+        QEHterDataset(data_path=data_configs['valid_data'][3])
+    )
+
+    training_iterator = DataIterator(dataset=train_bitext_dataset,
+                                     batch_size=training_configs["batch_size"],
+                                     use_bucket=training_configs['use_bucket'],
+                                     buffer_size=training_configs['buffer_size'],
+                                     batching_func=training_configs['batching_key'],
+                                     world_size=world_size,
+                                     rank=rank,
+                                     shuffle=True)
+
+    valid_iterator = DataIterator(dataset=valid_bitext_dataset,
+                                  batch_size=training_configs['valid_batch_size'],
+                                  use_bucket=False, buffer_size=100000, numbering=False)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    # ================================ Begin ======================================== #
+    # Build Model & Optimizer
+    # We would do steps below on after another
+    #     1. build models & criterion
+    #     2. move models & criterion to gpu if needed
+    #     3. load pre-trained model if needed
+    #     4. build optimizer
+    #     5. build learning rate scheduler if needed
+    #     6. load checkpoints if needed
+
+    # 0. Initial
+
+    lrate = optimizer_configs['learning_rate']
+    model_collections = Collections()
+
+    best_model_prefix = os.path.join(flags.saveto, flags.model_name + Constants.MY_BEST_MODEL_SUFFIX)
+
+    # 1. Build Model & Criterion
+    INFO('Building model...')
+    timer.tic()
+    discriminator = build_model(n_src_vocab=vocab_src.max_n_words,
+                                n_tgt_vocab=vocab_tgt.max_n_words,
+                                padding_idx=vocab_src.pad, **discriminator_configs)
+
+    generator_mlm = build_model(n_src_vocab=vocab_src.max_n_words,
+                                n_tgt_vocab=vocab_tgt.max_n_words,
+                                padding_idx=vocab_src.pad, **generator_configs)
+    '''
+    generator_lm_forward = build_model(n_src_vocab=vocab_src.max_n_words,
+                                       n_tgt_vocab=vocab_tgt.max_n_words,
+                                       padding_idx=vocab_src.pad, **generator_configs)
+
+    generator_lm_backward = build_model(n_src_vocab=vocab_src.max_n_words,
+                                        n_tgt_vocab=vocab_tgt.max_n_words,
+                                        padding_idx=vocab_src.pad, **generator_configs)
+    '''
+
+    if flags.criterion == "focal_loss":
+        critic = NMTCriterionFocalLoss(padding_idx=0, ignore_idx=0)
+    elif flags.criterion == "nll_loss":
+        critic = NMTCriterion(padding_idx=0, ignore_idx=0, one_class=True)
+    elif flags.criterion == "hinge_loss":
+        critic = NMTCriterionHingeLoss(padding_idx=0, ignore_idx=0, one_class=True)
+
+    critic_mse = torch.nn.MSELoss(reduce=True, size_average=True)
+    INFO(critic)
+    INFO(critic_mse)
+    # 2. Move to GPU
+    if Constants.USE_GPU:
+        discriminator = discriminator.cuda()
+        generator_mlm = generator_mlm.cuda()
+        # generator_lm_forward = generator_lm_forward.cuda()
+        # generator_lm_backward = generator_lm_backward.cuda()
+        critic = critic.cuda()
+        critic_mse = critic_mse.cuda()
+
+    # 3. Load pretrained model if needed
+    load_pretrained_model(generator_mlm, flags.pretrain_generator_mlm_path, exclude_prefix=None,
+                          device=Constants.CURRENT_DEVICE)
+    # load_pretrained_model(generator_lm_forward, flags.pretrain_generator_lm_forward_path, exclude_prefix=None,
+    #                      device=Constants.CURRENT_DEVICE)
+    # load_pretrained_model(generator_lm_backward, flags.pretrain_generator_lm_backward_path, exclude_prefix=None,
+    #                      device=Constants.CURRENT_DEVICE)
+
+    # 加载MLM的embedding层到判别器中
+    INFO('load embedding')
+    times_bigger = int(discriminator_configs['d_model'] / generator_configs['d_model'])
+    for key in discriminator.encoder.embeddings.embeddings.state_dict().keys():
+        discriminator.encoder.embeddings.embeddings.state_dict()[key].copy_(
+            generator_mlm.encoder.embeddings.embeddings.state_dict()[key].repeat(1, times_bigger))
+        discriminator.decoder.embeddings.embeddings.state_dict()[key].copy_(
+            generator_mlm.decoder.embeddings.embeddings.state_dict()[key].repeat(1, times_bigger))
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+    load_pretrained_model(discriminator, flags.pretrain_discriminator_path, exclude_prefix=None,device=Constants.CURRENT_DEVICE)
+    
+    # 4. Build optimizer
+    INFO('Building Optimizer...')
+
+    if not flags.multi_gpu:
+        optim = Optimizer(name=optimizer_configs['optimizer'],
+                          model=discriminator,
+                          lr=lrate,
+                          grad_clip=optimizer_configs['grad_clip'],
+                          optim_args=optimizer_configs['optimizer_params'],
+                          update_cycle=training_configs['update_cycle']
+                          )
+    else:
+        optim = dist.DistributedOptimizer(name=optimizer_configs['optimizer'],
+                                          model=discriminator,
+                                          lr=lrate,
+                                          grad_clip=optimizer_configs['grad_clip'],
+                                          optim_args=optimizer_configs['optimizer_params'],
+                                          device_id=local_rank
+                                          )
+
+    # 加载embedding后是否要更新embedding参数。似乎embedding矩阵没有bias。
+    # discriminator.encoder.embeddings.embeddings.weight.requires_grad = False
+    # discriminator.decoder.embeddings.embeddings.weight.requires_grad = False
+
+    # 5. Build scheduler for optimizer if needed
+    scheduler = build_scheduler(schedule_method=optimizer_configs['schedule_method'],
+                                optimizer=optim, scheduler_configs=optimizer_configs['scheduler_configs'])
+
+    # 6. build moving average
+    if training_configs['moving_average_method'] is not None:
+        ma = MovingAverage(moving_average_method=training_configs['moving_average_method'],
+                           named_params=discriminator.named_parameters(),
+                           alpha=training_configs['moving_average_alpha'])
+    else:
+        ma = None
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    # broadcast parameters and optimizer states
+    if world_size > 1:
+        INFO("Broadcasting model parameters...")
+        dist.broadcast_parameters(params=discriminator.state_dict())
+        dist.broadcast_parameters(params=generator_mlm.state_dict())
+        # dist.broadcast_parameters(params=generator_lm_forward.state_dict())
+        # dist.broadcast_parameters(params=generator_lm_backward.state_dict())
+        INFO("Broadcasting optimizer states...")
+        dist.broadcast_optimizer_state(optimizer=optim.optim)
+        INFO('Done.')
+
+    # ================================================================================== #
+    # Prepare training
+
+    eidx = model_collections.get_collection("eidx", [0])[-1]
+    uidx = model_collections.get_collection("uidx", [1])[-1]
+    bad_count = model_collections.get_collection("bad_count", [0])[-1]
+    oom_count = model_collections.get_collection("oom_count", [0])[-1]
+    is_early_stop = model_collections.get_collection("is_early_stop", [False, ])[-1]
+
+    train_loss_sen_forward_meter = AverageMeter()
+    train_loss_sen_backward_meter = AverageMeter()
+    train_loss_word_meter = AverageMeter()
+    train_loss_sen_forward_hter_meter = AverageMeter()
+    train_loss_sen_backward_hter_meter = AverageMeter()
+    train_loss_word_hter_meter = AverageMeter()
+    sent_per_sec_meter = TimeMeter()
+    tok_per_sec_meter = TimeMeter()
+
+    update_cycle = training_configs['update_cycle']
+    grad_denom = 0
+    train_loss_sen_forward = 0.0
+    train_loss_sen_backward = 0.0
+    train_loss_word = 0.0
+    train_loss_sen_forward_hter = 0.0
+    train_loss_sen_backward_hter = 0.0
+    train_loss_word_hter = 0.0
+    cum_n_words = 0
+
+    if rank == 0:
+        summary_writer = SummaryWriter(log_dir=flags.log_path)
+    else:
+        summary_writer = None
+
+    sent_per_sec_meter.start()
+    tok_per_sec_meter.start()
+
+    no_sigmoid = False
+    if flags.criterion == "hinge_loss":
+        no_sigmoid = True
+
+    INFO('Begin training...')
+
+    while True:
+
+        if summary_writer is not None:
+            summary_writer.add_scalar("Epoch", (eidx + 1), uidx)
+
+        # Build iterator and progress bar
+        training_iter = training_iterator.build_generator()
+
+        if rank == 0:
+            training_progress_bar = tqdm(desc='  - (Epoch %d)   ' % eidx,
+                                         total=len(training_iterator),
+                                         unit="sents"
+                                         )
+        else:
+            training_progress_bar = None
+        for batch in training_iter:
+
+            seqs_x, seqs_y = batch
+            batch_size = len(seqs_x)
+            cum_n_words += sum(len(s) for s in seqs_y)
+
+            # len_seqs_y = []
+            # for s in seqs_y:
+            #     len_seqs_y.append(len(s))
+            # min_len_seqs_y = min(len_seqs_y)
+
+            try:
+                # Prepare data, 同时得到三种模型的输入数据
+                x, y, y_mask, y_reverse, lm_ids = prepare_data_all(seqs_x, seqs_y, cuda=Constants.USE_GPU)
+                # lm_ids 标记出哪些位置是被mask的，这些词是我需要拿来用的，非0表示被mask的。
+
+                # 根据正向和反向LM的来计算句子级别的带噪数据
+                # ini_tgt_seq_len = random.randint(1, max(1, min_len_seqs_y))
+                # +1 是因为有bos。
+                # ini_tgt_seq = y[:, :ini_tgt_seq_len + 1]
+                # ini_tgt_seq_reverse = y_reverse[:, :ini_tgt_seq_len + 1]
+
+                # 根据MLM生成词级别的带噪数据
+                with torch.no_grad():
+                    # 输入是否带有mask并不关键
+                    # mlm_logits = generator_mlm(x, y, 'MLM')
+                    mlm_logits = generator_mlm(x, y_mask, 'MLM', log_probs=False)
+                '''
+                with torch.no_grad():
+                    word_ids = beam_search(nmt_model=generator_lm_forward, beam_size=2,
+                                           max_steps=y.size()[1]-ini_tgt_seq_len,
+                                           src_seqs=x, ini_tgt_seqs=ini_tgt_seq, alpha=0.0)
+                    word_ids_reverse = beam_search(nmt_model=generator_lm_backward, beam_size=2,
+                                                   max_steps=y.size()[1]-ini_tgt_seq_len,
+                                                   src_seqs=x, ini_tgt_seqs=ini_tgt_seq_reverse, alpha=0.0)
+                '''
+
+                word_noise_data, word_noise_label, word_hter_label = gen_noise_data5(y, mlm_logits, lm_ids, 100)
+                
+                loss_word, loss_word_hter = \
+                    compute_forward_discriminator_one_class(model=discriminator,
+                                                  critic=critic,
+                                                  critic_mse=critic_mse,
+                                                  seqs_x=x,
+                                                  seqs_y=word_noise_data,
+                                                  lm_ids=word_noise_label,
+                                                  hter_label=word_hter_label,
+                                                  eval=False,
+                                                  normalization=1.0,
+                                                  norm_by_words=training_configs["norm_by_words"],
+                                                  no_sigmoid=no_sigmoid
+                                                  )
+                
+                loss_sen_forward = 0
+                loss_sen_forward_hter = 0
+                loss_sen_backward = 0
+                loss_sen_backward_hter = 0
+                if np.isnan(loss_word) or np.isnan(loss_word_hter) or np.isnan(loss_sen_forward) or \
+                    np.isnan(loss_sen_forward_hter) or np.isnan(loss_sen_backward) or np.isnan(loss_sen_backward_hter):
+                    WARN("NaN detected!")
+                update_cycle -= 1
+                grad_denom += batch_size
+
+                train_loss_sen_forward += loss_sen_forward
+                train_loss_sen_backward += loss_sen_backward
+                train_loss_word += loss_word
+
+                train_loss_sen_forward_hter += loss_sen_forward_hter
+                train_loss_sen_backward_hter += loss_sen_backward_hter
+                train_loss_word_hter += loss_word_hter
+
+            except RuntimeError as e:
+                if 'out of memory' in str(e):
+                    print('| WARNING: ran out of memory, skipping batch')
+                    oom_count += 1
+                else:
+                    raise e
+
+            # When update_cycle becomes 0, it means end of one batch. Several things will be done:
+            # - update parameters
+            # - reset update_cycle and grad_denom, update uidx
+            # - learning rate scheduling
+            # - update moving average
+
+            if update_cycle == 0:
+
+                # 0. reduce variables
+                if world_size > 1:
+                    grad_denom = dist.all_reduce_py(grad_denom)
+                    train_loss_sen_forward = dist.all_reduce_py(train_loss_sen_forward)
+                    train_loss_sen_backward = dist.all_reduce_py(train_loss_sen_backward)
+                    train_loss_word = dist.all_reduce_py(train_loss_word)
+                    train_loss_sen_forward_hter = dist.all_reduce_py(train_loss_sen_forward_hter)
+                    train_loss_sen_backward_hter = dist.all_reduce_py(train_loss_sen_backward_hter)
+                    train_loss_word_hter = dist.all_reduce_py(train_loss_word_hter)
+                    cum_n_words = dist.all_reduce_py(cum_n_words)
+
+                # 1. update parameters
+                optim.step(denom=grad_denom)
+                optim.zero_grad()
+
+                if training_progress_bar is not None:
+                    training_progress_bar.update(grad_denom)
+                    training_progress_bar.set_description(' - (Epc {}, Upd {}) '.format(eidx, uidx))
+
+                # 2. learning rate scheduling
+                if scheduler is not None and optimizer_configs["schedule_method"] != "loss":
+                    scheduler.step(global_step=uidx)
+
+                # 3. update moving average
+                if ma is not None and eidx >= training_configs['moving_average_start_epoch']:
+                    ma.step()
+
+                # 4. update meters
+                train_loss_sen_forward_meter.update(train_loss_sen_forward, grad_denom)
+                train_loss_sen_backward_meter.update(train_loss_sen_backward, grad_denom)
+                train_loss_word_meter.update(train_loss_word, grad_denom)
+                train_loss_sen_forward_hter_meter.update(train_loss_sen_forward_hter, grad_denom)
+                train_loss_sen_backward_hter_meter.update(train_loss_sen_backward_hter, grad_denom)
+                train_loss_word_hter_meter.update(train_loss_word_hter, grad_denom)
+                sent_per_sec_meter.update(grad_denom)
+                tok_per_sec_meter.update(cum_n_words)
+
+                # 5. reset accumulated variables, update uidx
+                update_cycle = training_configs['update_cycle']
+                grad_denom = 0
+                uidx += 1
+                cum_n_words = 0.0
+                train_loss_sen_forward = 0.0
+                train_loss_sen_backward = 0.0
+                train_loss_word = 0.0
+
+                train_loss_sen_forward_hter = 0.0
+                train_loss_sen_backward_hter = 0.0
+                train_loss_word_hter = 0.0
+
+            else:
+                continue
+            # ================================================================================== #
+            # Display some information
+            if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['disp_freq']):
+
+                lrate = list(optim.get_lrate())[0]
+
+                if summary_writer is not None:
+                    summary_writer.add_scalar("Speed(sents/sec)", scalar_value=sent_per_sec_meter.ave, global_step=uidx)
+                    summary_writer.add_scalar("Speed(words/sec)", scalar_value=tok_per_sec_meter.ave, global_step=uidx)
+                    summary_writer.add_scalar("train_loss_sen_forward", scalar_value=train_loss_sen_forward_meter.ave,
+                                              global_step=uidx)
+                    summary_writer.add_scalar("train_loss_sen_backward", scalar_value=train_loss_sen_backward_meter.ave,
+                                              global_step=uidx)
+                    summary_writer.add_scalar("train_loss_word", scalar_value=train_loss_word_meter.ave,
+                                              global_step=uidx)
+                    summary_writer.add_scalar("train_loss_sen_forward_hter",
+                                              scalar_value=train_loss_sen_forward_hter_meter.ave, global_step=uidx)
+                    summary_writer.add_scalar("train_loss_sen_backward_hter",
+                                              scalar_value=train_loss_sen_backward_hter_meter.ave, global_step=uidx)
+                    summary_writer.add_scalar("train_loss_word_hter", scalar_value=train_loss_word_hter_meter.ave,
+                                              global_step=uidx)
+                    summary_writer.add_scalar("lrate", scalar_value=lrate, global_step=uidx)
+                    summary_writer.add_scalar("oom_count", scalar_value=oom_count, global_step=uidx)
+
+                # Reset Meters
+                sent_per_sec_meter.reset()
+                tok_per_sec_meter.reset()
+                train_loss_sen_forward_meter.reset()
+                train_loss_sen_backward_meter.reset()
+                train_loss_word_meter.reset()
+                train_loss_sen_forward_hter_meter.reset()
+                train_loss_sen_backward_hter_meter.reset()
+                train_loss_word_hter_meter.reset()
+
+            # ================================================================================== #
+            # Loss Validation & Learning rate annealing
+            if should_trigger_by_steps(global_step=uidx, n_epoch=eidx, every_n_step=training_configs['loss_valid_freq'],
+                                       debug=flags.debug):
+                with cache_parameters(discriminator):
+
+                    if ma is not None:
+                        discriminator.load_state_dict(ma.export_ma_params(), strict=False)
+
+                    valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p = \
+                        loss_evaluation_qe_one_class(discriminator=discriminator,
+                                           critic=critic,
+                                           critic_mse=critic_mse,
+                                           valid_iterator=valid_iterator,
+                                           no_sigmoid=no_sigmoid)
 
                     # 保存ckpt
                     torch.save(discriminator.state_dict(), best_model_prefix + '.ckpt.' + str(uidx))
@@ -9853,7 +11489,13 @@ def finetune_qe(flags):
     load_pretrained_model(discriminator, flags.pretrain_path, exclude_prefix=None,
                           device="cpu")
     
-    critic = NMTCriterion(padding_idx=0, ignore_idx=0)
+    if flags.criterion == "focal_loss":
+        critic = NMTCriterionFocalLoss(padding_idx=0, ignore_idx=0)
+    elif flags.criterion == "nll_loss":
+        critic = NMTCriterion(padding_idx=0, ignore_idx=0)
+    elif flags.criterion == "margin_loss":
+        critic = NMTCriterionMarginLoss(padding_idx=0, ignore_idx=0)
+
     critic_mse = torch.nn.MSELoss(reduce=True, size_average=True)
     INFO(critic)
     INFO(critic_mse)
@@ -10032,6 +11674,1842 @@ def finetune_qe(flags):
         eidx += 1
         if eidx > training_configs["max_epochs"]:
             break
+
+
+def finetune_qe_margin_loss(flags):
+    """
+    FLAGS:
+        saveto: str
+        reload: store_true
+        config_path: str
+        pretrain_path: str, default=""
+        model_name: str
+        log_path: str
+    """
+
+    # write log of training to file.
+    write_log_to_file(os.path.join(flags.log_path, "%s.log" % time.strftime("%Y%m%d-%H%M%S")))
+    Constants.USE_GPU = flags.use_gpu
+    config_path = os.path.abspath(flags.config_path)
+    with open(config_path.strip()) as f:
+        configs = yaml.safe_load(f)
+    INFO(pretty_configs(configs))
+    # Add default configs
+    configs = prepare_configs(flags.config_path, flags.predefined_config)
+    discriminator_model_configs = configs['discriminator_configs']
+    data_configs = configs['data_configs']
+    optimizer_configs = configs['optimizer_configs']
+    training_configs = configs['training_configs']
+
+    Constants.SEED = training_configs['seed']
+    # Constants.SEED = flags.seed
+
+    set_seed(Constants.SEED)
+
+    best_model_prefix = os.path.join(flags.saveto,
+                                     flags.model_name + Constants.MY_BEST_MODEL_SUFFIX)
+    timer = Timer()
+
+    # ================================================================================== #
+    # Load Data
+
+    INFO('Loading data...')
+    timer.tic()
+
+    # Generate target dictionary
+    vocab_src = Vocabulary.build_from_file(**data_configs['vocabularies'][0])
+    vocab_tgt = Vocabulary.build_from_file(**data_configs['vocabularies'][1])
+
+    train_batch_size = training_configs["batch_size"]
+    train_buffer_size = training_configs["buffer_size"]
+
+    train_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['train_data'][0],
+                        vocabulary=vocab_src,
+                        max_len=data_configs['max_len'][0],
+                        ),
+        TextLineDataset(data_path=data_configs['train_data'][1],
+                        vocabulary=vocab_tgt,
+                        max_len=data_configs['max_len'][1],
+                        ),
+        QETagsDataset(data_path=data_configs['train_data'][2],
+                      max_len=data_configs['max_len'][1]
+                      ),
+        QEHterDataset(data_path=data_configs['train_data'][3])
+    )
+
+    valid_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['valid_data'][0],
+                        vocabulary=vocab_src,
+                        ),
+        TextLineDataset(data_path=data_configs['valid_data'][1],
+                        vocabulary=vocab_tgt,
+                        ),
+        QETagsDataset(data_path=data_configs['valid_data'][2]),
+        QEHterDataset(data_path=data_configs['valid_data'][3])
+    )
+
+    training_iterator = DataIterator(dataset=train_bitext_dataset,
+                                     batch_size=train_batch_size,
+                                     use_bucket=training_configs['use_bucket'],
+                                     buffer_size=train_buffer_size,
+                                     batching_func=training_configs['batching_key'],
+                                     shuffle=True)
+
+    valid_iterator = DataIterator(dataset=valid_bitext_dataset,
+                                  batch_size=training_configs['valid_batch_size'],
+                                  use_bucket=False, numbering=False,
+                                  shuffle=True)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    lrate = optimizer_configs['learning_rate']
+    is_early_stop = False
+
+    # ================================ Begin ======================================== #
+    # Build Model & Optimizer
+    # We would do steps below on after another
+    #     0. load transformer
+    #     1. build models & criterion
+    #     2. move models & criterion to gpu if needed
+    #     3. load pre-trained model if needed
+    #     4. build optimizer
+    #     5. build learning rate scheduler if needed
+    #     6. load checkpoints if needed
+
+    # 00. Initial
+    model_collections = Collections()
+
+    # 0. load transformer
+    INFO('Building transformer model...')
+    timer.tic()
+    discriminator = build_model(n_src_vocab=vocab_src.max_n_words,
+                                n_tgt_vocab=vocab_tgt.max_n_words, **discriminator_model_configs)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    INFO('Reloading model parameters...')
+    timer.tic()
+    # 加载之前训好的模型参数
+    #params = load_model_parameters(flags.pretrain_path, map_location="cpu")
+    #discriminator.load_state_dict(params)
+    # 如果有训好的，才加载
+    load_pretrained_model(discriminator, flags.pretrain_path, exclude_prefix=None,
+                          device="cpu")
+    
+    if flags.criterion == "focal_loss":
+        critic = NMTCriterionFocalLoss(padding_idx=0, ignore_idx=0)
+    elif flags.criterion == "nll_loss":
+        critic = NMTCriterion(padding_idx=0, ignore_idx=0)
+    elif flags.criterion == "margin_loss":
+        critic = NMTCriterionMarginLoss(padding_idx=0, ignore_idx=0)
+
+    critic_mse = torch.nn.MSELoss(reduce=True, size_average=True)
+    INFO(critic)
+    INFO(critic_mse)
+
+    if Constants.USE_GPU:
+        discriminator.cuda()
+        critic = critic.cuda()
+        critic_mse = critic_mse.cuda()
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    # 4. Build optimizer
+    INFO('Building Optimizer...')
+    optim = Optimizer(name=optimizer_configs['optimizer'],
+                      model=discriminator,
+                      lr=lrate,
+                      grad_clip=optimizer_configs['grad_clip'],
+                      weight_decay=optimizer_configs['weight_decay'],
+                      optim_args=optimizer_configs['optimizer_params']
+                      )
+
+    # 5. Build scheduler for optimizer if needed
+    if optimizer_configs['schedule_method'] is not None:
+        scheduler = build_scheduler(schedule_method=optimizer_configs['schedule_method'],
+                                    optimizer=optim, scheduler_configs=optimizer_configs['scheduler_configs'])
+    else:
+        scheduler = None
+
+    # 6. build moving average
+    ma = None
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    eidx = model_collections.get_collection("eidx", [0])[-1]
+    uidx = model_collections.get_collection("uidx", [0])[-1]
+    bad_count = model_collections.get_collection("bad_count", [0])[-1]
+    oom_count = model_collections.get_collection("oom_count", [0])[-1]
+
+    summary_writer = SummaryWriter(log_dir=flags.log_path)
+
+    cum_samples = 0
+    cum_words = 0
+
+    # Timer for computing speed
+    timer_for_speed = Timer()
+    timer_for_speed.tic()
+
+    INFO('Begin training...')
+
+    save_id = 0
+
+    while True:
+
+        summary_writer.add_scalar("Epoch", (eidx + 1), uidx)
+        # Build iterator and progress bar
+        training_iter = training_iterator.build_generator()
+        training_progress_bar = tqdm(desc='  - (Epoch %d)   ' % eidx,
+                                     total=len(training_iterator),
+                                     unit="sents")
+        train_loss = 0
+        train_loss_hter = 0
+
+        for batch in training_iter:
+            discriminator.eval()
+            uidx += 1
+            if optimizer_configs["schedule_method"] is not None and optimizer_configs["schedule_method"] != "loss":
+                scheduler.step(global_step=uidx)
+
+            seqs_x, seqs_y, xy_label, xy_hter = batch
+
+            n_samples_t = len(seqs_x)
+            n_words_t = sum(len(s) for s in seqs_y)
+            cum_samples += n_samples_t
+            cum_words += n_words_t
+            training_progress_bar.update(n_samples_t)
+
+            x, y, xy_label = prepare_data_qe(seqs_x, seqs_y, xy_label, cuda=Constants.USE_GPU)
+
+            if Constants.USE_GPU:
+                xy_hter = torch.tensor(xy_hter)
+                xy_hter = xy_hter.cuda()
+
+            loss, loss_hter = compute_forward_discriminator_margin(model=discriminator,
+                                                            critic=critic,
+                                                            critic_mse=critic_mse,
+                                                            seqs_x=x,
+                                                            seqs_y=y,
+                                                            lm_ids=xy_label,
+                                                            hter_label=xy_hter)
+
+            train_loss += loss
+            train_loss_hter += loss_hter
+            # --------------------------------------------
+            if (uidx) % training_configs['update_cycle'] == 0:
+                optim.step()
+                optim.zero_grad()
+
+            if ma is not None and eidx >= training_configs['moving_average_start_epoch']:
+                ma.step()
+
+            # ================================================================================== #
+            # Display some information
+            if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['disp_freq']):
+                # words per second and sents per second
+                words_per_sec = cum_words / (timer.toc(return_seconds=True))
+                sents_per_sec = cum_samples / (timer.toc(return_seconds=True))
+                lrate = list(optim.get_lrate())[0]
+
+                summary_writer.add_scalar("Speed(words/sec)", scalar_value=words_per_sec, global_step=uidx)
+                summary_writer.add_scalar("Speed(sents/sen)", scalar_value=sents_per_sec, global_step=uidx)
+                summary_writer.add_scalar("lrate", scalar_value=lrate, global_step=uidx)
+                summary_writer.add_scalar("oom_count", scalar_value=oom_count, global_step=uidx)
+                INFO("{0} TrainLoss: {1:.4f} TrainLoss_hter: {2:.4f} ".format(
+                    uidx, train_loss / training_configs['disp_freq'], train_loss_hter / training_configs['disp_freq']
+                ))
+
+                # Reset timer
+                timer.tic()
+                cum_words = 0
+                cum_samples = 0
+                train_loss = 0
+                train_loss_hter = 0
+
+            # ================================================================================== #
+            # Saving checkpoints
+            if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['save_freq'], debug=flags.debug):
+                model_collections.add_to_collection("uidx", uidx)
+                model_collections.add_to_collection("eidx", eidx)
+                model_collections.add_to_collection("bad_count", bad_count)
+
+            # ================================================================================== #
+            # Loss Validation & Learning rate annealing
+            if should_trigger_by_steps(global_step=uidx, n_epoch=eidx, every_n_step=training_configs['loss_valid_freq'],
+                                       debug=flags.debug):
+
+                valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p = \
+                    loss_evaluation_qe_margin(discriminator=discriminator,
+                                       critic=critic,
+                                       critic_mse=critic_mse,
+                                       valid_iterator=valid_iterator)
+
+                # 保存ckpt
+                torch.save(discriminator.state_dict(), best_model_prefix + '.ckpt.' + str(uidx))
+                torch.save(discriminator.state_dict(), best_model_prefix + '.last_ckpt')
+
+                model_collections.add_to_collection("history_losses", valid_loss)   # 用词级别loss保存
+                # model_collections.add_to_collection("history_losses", valid_loss_hter)  # 用句子级loss保存
+                min_loss = np.array(model_collections.get_collection("history_losses")).min()
+
+                if valid_loss <= min_loss:   # 用词级别loss保存
+                # if valid_loss_hter <= min_loss:  # 用句子级loss保存
+                    bad_count = 0
+                    if is_early_stop is False:
+                        # 1. save the best model
+                        torch.save(discriminator.state_dict(), best_model_prefix + ".final")
+                        #torch.save(discriminator.state_dict(), best_model_prefix + "." + str(save_id))
+                        #INFO("save model id: {0}".format(save_id))
+                        #save_id += 1
+                else:
+                    bad_count += 1
+                    # At least one epoch should be traversed
+                    if bad_count >= training_configs['early_stop_patience'] and eidx > 0:
+                        is_early_stop = True
+                        WARN("Early Stop!")
+
+                summary_writer.add_scalar("bad_count", bad_count, uidx)
+
+                INFO("{0} Loss: {1:.2f} Loss_hter: {2:.4f} F1_good: {3:.4f} F1_bad: {4:.4f} "
+                     "F1_multi: {5:.4f} pearsonr:{6:.2f} patience: {7}".
+                     format(uidx, valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p, bad_count))
+            if is_early_stop is True:
+                break
+        if is_early_stop is True:
+            break
+        training_progress_bar.close()
+
+        eidx += 1
+        if eidx > training_configs["max_epochs"]:
+            break
+
+
+def finetune_qe_one_class(flags):
+    # 词级别从多分类变成单分类，最后的线性层从3维改成1维
+    """
+    FLAGS:
+        saveto: str
+        reload: store_true
+        config_path: str
+        pretrain_path: str, default=""
+        model_name: str
+        log_path: str
+    """
+
+    # write log of training to file.
+    write_log_to_file(os.path.join(flags.log_path, "%s.log" % time.strftime("%Y%m%d-%H%M%S")))
+    Constants.USE_GPU = flags.use_gpu
+    config_path = os.path.abspath(flags.config_path)
+    with open(config_path.strip()) as f:
+        configs = yaml.safe_load(f)
+    INFO(pretty_configs(configs))
+    # Add default configs
+    configs = prepare_configs(flags.config_path, flags.predefined_config)
+    discriminator_model_configs = configs['discriminator_configs']
+    data_configs = configs['data_configs']
+    optimizer_configs = configs['optimizer_configs']
+    training_configs = configs['training_configs']
+
+    Constants.SEED = training_configs['seed']
+    # Constants.SEED = flags.seed
+
+    set_seed(Constants.SEED)
+
+    best_model_prefix = os.path.join(flags.saveto,
+                                     flags.model_name + Constants.MY_BEST_MODEL_SUFFIX)
+    timer = Timer()
+
+    # ================================================================================== #
+    # Load Data
+
+    INFO('Loading data...')
+    timer.tic()
+
+    # Generate target dictionary
+    vocab_src = Vocabulary.build_from_file(**data_configs['vocabularies'][0])
+    vocab_tgt = Vocabulary.build_from_file(**data_configs['vocabularies'][1])
+
+    train_batch_size = training_configs["batch_size"]
+    train_buffer_size = training_configs["buffer_size"]
+
+    train_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['train_data'][0],
+                        vocabulary=vocab_src,
+                        max_len=data_configs['max_len'][0],
+                        ),
+        TextLineDataset(data_path=data_configs['train_data'][1],
+                        vocabulary=vocab_tgt,
+                        max_len=data_configs['max_len'][1],
+                        ),
+        QETagsDataset(data_path=data_configs['train_data'][2],
+                      max_len=data_configs['max_len'][1]
+                      ),
+        QEHterDataset(data_path=data_configs['train_data'][3])
+    )
+
+    valid_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['valid_data'][0],
+                        vocabulary=vocab_src,
+                        ),
+        TextLineDataset(data_path=data_configs['valid_data'][1],
+                        vocabulary=vocab_tgt,
+                        ),
+        QETagsDataset(data_path=data_configs['valid_data'][2]),
+        QEHterDataset(data_path=data_configs['valid_data'][3])
+    )
+
+    training_iterator = DataIterator(dataset=train_bitext_dataset,
+                                     batch_size=train_batch_size,
+                                     use_bucket=training_configs['use_bucket'],
+                                     buffer_size=train_buffer_size,
+                                     batching_func=training_configs['batching_key'],
+                                     shuffle=True)
+
+    valid_iterator = DataIterator(dataset=valid_bitext_dataset,
+                                  batch_size=training_configs['valid_batch_size'],
+                                  use_bucket=False, numbering=False,
+                                  shuffle=True)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    lrate = optimizer_configs['learning_rate']
+    is_early_stop = False
+
+    # ================================ Begin ======================================== #
+    # Build Model & Optimizer
+    # We would do steps below on after another
+    #     0. load transformer
+    #     1. build models & criterion
+    #     2. move models & criterion to gpu if needed
+    #     3. load pre-trained model if needed
+    #     4. build optimizer
+    #     5. build learning rate scheduler if needed
+    #     6. load checkpoints if needed
+
+    # 00. Initial
+    model_collections = Collections()
+
+    # 0. load transformer
+    INFO('Building transformer model...')
+    timer.tic()
+    discriminator = build_model(n_src_vocab=vocab_src.max_n_words,
+                                n_tgt_vocab=vocab_tgt.max_n_words, **discriminator_model_configs)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    INFO('Reloading model parameters...')
+    timer.tic()
+    # 加载之前训好的模型参数
+    #params = load_model_parameters(flags.pretrain_path, map_location="cpu")
+    #discriminator.load_state_dict(params)
+    # 如果有训好的，才加载
+    load_pretrained_model(discriminator, flags.pretrain_path, exclude_prefix=None,
+                          device="cpu")
+    
+    if flags.criterion == "focal_loss":
+        critic = NMTCriterionFocalLoss(padding_idx=0, ignore_idx=0)
+    elif flags.criterion == "nll_loss":
+        critic = NMTCriterion(padding_idx=0, ignore_idx=0, one_class=True)
+    elif flags.criterion == "hinge_loss":
+        critic = NMTCriterionHingeLoss(padding_idx=0, ignore_idx=0, one_class=True)
+
+    critic_mse = torch.nn.MSELoss(reduce=True, size_average=True)
+    INFO(critic)
+    INFO(critic_mse)
+
+    if Constants.USE_GPU:
+        discriminator.cuda()
+        critic = critic.cuda()
+        critic_mse = critic_mse.cuda()
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    # 4. Build optimizer
+    INFO('Building Optimizer...')
+    optim = Optimizer(name=optimizer_configs['optimizer'],
+                      model=discriminator,
+                      lr=lrate,
+                      grad_clip=optimizer_configs['grad_clip'],
+                      weight_decay=optimizer_configs['weight_decay'],
+                      optim_args=optimizer_configs['optimizer_params']
+                      )
+
+    # 5. Build scheduler for optimizer if needed
+    if optimizer_configs['schedule_method'] is not None:
+        scheduler = build_scheduler(schedule_method=optimizer_configs['schedule_method'],
+                                    optimizer=optim, scheduler_configs=optimizer_configs['scheduler_configs'])
+    else:
+        scheduler = None
+
+    # 6. build moving average
+    ma = None
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    eidx = model_collections.get_collection("eidx", [0])[-1]
+    uidx = model_collections.get_collection("uidx", [0])[-1]
+    bad_count = model_collections.get_collection("bad_count", [0])[-1]
+    oom_count = model_collections.get_collection("oom_count", [0])[-1]
+
+    summary_writer = SummaryWriter(log_dir=flags.log_path)
+
+    cum_samples = 0
+    cum_words = 0
+
+    # Timer for computing speed
+    timer_for_speed = Timer()
+    timer_for_speed.tic()
+
+    no_sigmoid = False
+    if flags.criterion == "hinge_loss":
+        no_sigmoid = True
+
+
+    INFO('Begin training...')
+
+    save_id = 0
+
+    while True:
+
+        summary_writer.add_scalar("Epoch", (eidx + 1), uidx)
+        # Build iterator and progress bar
+        training_iter = training_iterator.build_generator()
+        training_progress_bar = tqdm(desc='  - (Epoch %d)   ' % eidx,
+                                     total=len(training_iterator),
+                                     unit="sents")
+        train_loss = 0
+        train_loss_hter = 0
+
+        for batch in training_iter:
+            discriminator.eval()
+            uidx += 1
+            if optimizer_configs["schedule_method"] is not None and optimizer_configs["schedule_method"] != "loss":
+                scheduler.step(global_step=uidx)
+
+            seqs_x, seqs_y, xy_label, xy_hter = batch
+
+            n_samples_t = len(seqs_x)
+            n_words_t = sum(len(s) for s in seqs_y)
+            cum_samples += n_samples_t
+            cum_words += n_words_t
+            training_progress_bar.update(n_samples_t)
+
+            x, y, xy_label = prepare_data_qe(seqs_x, seqs_y, xy_label, cuda=Constants.USE_GPU)
+
+            if Constants.USE_GPU:
+                xy_hter = torch.tensor(xy_hter)
+                xy_hter = xy_hter.cuda()
+
+            loss, loss_hter = compute_forward_discriminator_one_class(model=discriminator,
+                                                            critic=critic,
+                                                            critic_mse=critic_mse,
+                                                            seqs_x=x,
+                                                            seqs_y=y,
+                                                            lm_ids=xy_label,
+                                                            hter_label=xy_hter,
+                                                            no_sigmoid=no_sigmoid)
+
+            train_loss += loss
+            train_loss_hter += loss_hter
+            # --------------------------------------------
+            if (uidx) % training_configs['update_cycle'] == 0:
+                optim.step()
+                optim.zero_grad()
+
+            if ma is not None and eidx >= training_configs['moving_average_start_epoch']:
+                ma.step()
+
+            # ================================================================================== #
+            # Display some information
+            if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['disp_freq']):
+                # words per second and sents per second
+                words_per_sec = cum_words / (timer.toc(return_seconds=True))
+                sents_per_sec = cum_samples / (timer.toc(return_seconds=True))
+                lrate = list(optim.get_lrate())[0]
+
+                summary_writer.add_scalar("Speed(words/sec)", scalar_value=words_per_sec, global_step=uidx)
+                summary_writer.add_scalar("Speed(sents/sen)", scalar_value=sents_per_sec, global_step=uidx)
+                summary_writer.add_scalar("lrate", scalar_value=lrate, global_step=uidx)
+                summary_writer.add_scalar("oom_count", scalar_value=oom_count, global_step=uidx)
+                INFO("{0} TrainLoss: {1:.4f} TrainLoss_hter: {2:.4f} ".format(
+                    uidx, train_loss / training_configs['disp_freq'], train_loss_hter / training_configs['disp_freq']
+                ))
+
+                # Reset timer
+                timer.tic()
+                cum_words = 0
+                cum_samples = 0
+                train_loss = 0
+                train_loss_hter = 0
+
+            # ================================================================================== #
+            # Saving checkpoints
+            if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['save_freq'], debug=flags.debug):
+                model_collections.add_to_collection("uidx", uidx)
+                model_collections.add_to_collection("eidx", eidx)
+                model_collections.add_to_collection("bad_count", bad_count)
+
+            # ================================================================================== #
+            # Loss Validation & Learning rate annealing
+            if should_trigger_by_steps(global_step=uidx, n_epoch=eidx, every_n_step=training_configs['loss_valid_freq'],
+                                       debug=flags.debug):
+
+                valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p = \
+                    loss_evaluation_qe_one_class(discriminator=discriminator,
+                                       critic=critic,
+                                       critic_mse=critic_mse,
+                                       valid_iterator=valid_iterator,
+                                       no_sigmoid=no_sigmoid)
+
+                # 保存ckpt
+                torch.save(discriminator.state_dict(), best_model_prefix + '.ckpt.' + str(uidx))
+                torch.save(discriminator.state_dict(), best_model_prefix + '.last_ckpt')
+
+                model_collections.add_to_collection("history_losses", valid_loss)   # 用词级别loss保存
+                # model_collections.add_to_collection("history_losses", valid_loss_hter)  # 用句子级loss保存
+                min_loss = np.array(model_collections.get_collection("history_losses")).min()
+
+                if valid_loss <= min_loss:   # 用词级别loss保存
+                # if valid_loss_hter <= min_loss:  # 用句子级loss保存
+                    bad_count = 0
+                    if is_early_stop is False:
+                        # 1. save the best model
+                        torch.save(discriminator.state_dict(), best_model_prefix + ".final")
+                        #torch.save(discriminator.state_dict(), best_model_prefix + "." + str(save_id))
+                        #INFO("save model id: {0}".format(save_id))
+                        #save_id += 1
+                else:
+                    bad_count += 1
+                    # At least one epoch should be traversed
+                    if bad_count >= training_configs['early_stop_patience'] and eidx > 0:
+                        is_early_stop = True
+                        WARN("Early Stop!")
+
+                summary_writer.add_scalar("bad_count", bad_count, uidx)
+
+                INFO("{0} Loss: {1:.2f} Loss_hter: {2:.4f} F1_good: {3:.4f} F1_bad: {4:.4f} "
+                     "F1_multi: {5:.4f} pearsonr:{6:.2f} patience: {7}".
+                     format(uidx, valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p, bad_count))
+            if is_early_stop is True:
+                break
+        if is_early_stop is True:
+            break
+        training_progress_bar.close()
+
+        eidx += 1
+        if eidx > training_configs["max_epochs"]:
+            break
+
+
+def finetune_qe_token_mask(flags):
+    # 训练时只关注没被mask的token来训练，别的不管
+    """
+    FLAGS:
+        saveto: str
+        reload: store_true
+        config_path: str
+        pretrain_path: str, default=""
+        model_name: str
+        log_path: str
+    """
+
+    # write log of training to file.
+    write_log_to_file(os.path.join(flags.log_path, "%s.log" % time.strftime("%Y%m%d-%H%M%S")))
+    Constants.USE_GPU = flags.use_gpu
+    config_path = os.path.abspath(flags.config_path)
+    with open(config_path.strip()) as f:
+        configs = yaml.safe_load(f)
+    INFO(pretty_configs(configs))
+    # Add default configs
+    configs = prepare_configs(flags.config_path, flags.predefined_config)
+    discriminator_model_configs = configs['discriminator_configs']
+    data_configs = configs['data_configs']
+    optimizer_configs = configs['optimizer_configs']
+    training_configs = configs['training_configs']
+
+    Constants.SEED = training_configs['seed']
+    # Constants.SEED = flags.seed
+
+    set_seed(Constants.SEED)
+
+    best_model_prefix = os.path.join(flags.saveto,
+                                     flags.model_name + Constants.MY_BEST_MODEL_SUFFIX)
+    timer = Timer()
+
+    # ================================================================================== #
+    # Load Data
+
+    INFO('Loading data...')
+    timer.tic()
+
+    # Generate target dictionary
+    vocab_src = Vocabulary.build_from_file(**data_configs['vocabularies'][0])
+    vocab_tgt = Vocabulary.build_from_file(**data_configs['vocabularies'][1])
+
+    if flags.add_feature:
+        with open(flags.align_bpe_path_mt2src_train, 'r', encoding='utf-8') as falign_m2s_train, \
+            open(flags.align_bpe_path_mt2src_dev, 'r', encoding='utf-8') as falign_m2s_dev:
+            align_bpe_dict_mt2src_train = json.load(falign_m2s_train)
+            align_bpe_dict_mt2src_dev = json.load(falign_m2s_dev)
+
+    train_batch_size = training_configs["batch_size"]
+    train_buffer_size = training_configs["buffer_size"]
+
+    train_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['train_data'][0],
+                        vocabulary=vocab_src,
+                        max_len=data_configs['max_len'][0],
+                        ),
+        TextLineDataset(data_path=data_configs['train_data'][1],
+                        vocabulary=vocab_tgt,
+                        max_len=data_configs['max_len'][1],
+                        ),
+        QETagsDataset(data_path=data_configs['train_data'][2],
+                      max_len=data_configs['max_len'][1]
+                      ),
+        QEHterDataset(data_path=data_configs['train_data'][3]),
+        QEHterDataset(data_path=data_configs['train_data'][4]),
+    )
+
+    valid_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['valid_data'][0],
+                        vocabulary=vocab_src,
+                        ),
+        TextLineDataset(data_path=data_configs['valid_data'][1],
+                        vocabulary=vocab_tgt,
+                        ),
+        QETagsDataset(data_path=data_configs['valid_data'][2]),
+        QEHterDataset(data_path=data_configs['valid_data'][3])
+    )
+    """
+    normal_train_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['normal_train_data'][0],
+                        vocabulary=vocab_src,
+                        max_len=data_configs['max_len'][0],
+                        ),
+        TextLineDataset(data_path=data_configs['normal_train_data'][1],
+                        vocabulary=vocab_tgt,
+                        max_len=data_configs['max_len'][1],
+                        ),
+        QETagsDataset(data_path=data_configs['normal_train_data'][2],
+                      max_len=data_configs['max_len'][1]
+                      ),
+        QEHterDataset(data_path=data_configs['normal_train_data'][3]),
+    )
+    """
+
+    training_iterator = DataIterator(dataset=train_bitext_dataset,
+                                     batch_size=train_batch_size,
+                                     use_bucket=training_configs['use_bucket'],
+                                     buffer_size=train_buffer_size,
+                                     batching_func=training_configs['batching_key'],
+                                     shuffle=False)
+
+    valid_iterator = DataIterator(dataset=valid_bitext_dataset,
+                                  batch_size=training_configs['valid_batch_size'],
+                                  use_bucket=False, numbering=False,
+                                  shuffle=False)
+    """
+    normal_train_iterator = DataIterator(dataset=normal_train_bitext_dataset,
+                                  batch_size=training_configs['valid_batch_size'],
+                                  use_bucket=False, numbering=False,
+                                  shuffle=True)
+    """
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    lrate = optimizer_configs['learning_rate']
+    is_early_stop = False
+
+    # ================================ Begin ======================================== #
+    # Build Model & Optimizer
+    # We would do steps below on after another
+    #     0. load transformer
+    #     1. build models & criterion
+    #     2. move models & criterion to gpu if needed
+    #     3. load pre-trained model if needed
+    #     4. build optimizer
+    #     5. build learning rate scheduler if needed
+    #     6. load checkpoints if needed
+
+    # 00. Initial
+    model_collections = Collections()
+
+    # 0. load transformer
+    INFO('Building transformer model...')
+    timer.tic()
+    discriminator = build_model(n_src_vocab=vocab_src.max_n_words,
+                                n_tgt_vocab=vocab_tgt.max_n_words, **discriminator_model_configs)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    INFO('Reloading model parameters...')
+    timer.tic()
+    # 加载之前训好的模型参数
+    #params = load_model_parameters(flags.pretrain_path, map_location="cpu")
+    #discriminator.load_state_dict(params)
+    # 如果有训好的，才加载
+    load_pretrained_model(discriminator, flags.pretrain_path, exclude_prefix=None,
+                          device="cpu")
+    
+    margin = False
+    if flags.criterion == "focal_loss":
+        critic = NMTCriterionFocalLoss(padding_idx=0, ignore_idx=0)
+    elif flags.criterion == "nll_loss":
+        critic = NMTCriterion(padding_idx=0, ignore_idx=0)
+    elif flags.criterion == "margin_loss":
+        critic = NMTCriterionMarginLoss(padding_idx=0, ignore_idx=0)
+        margin = True
+
+    critic_mse = torch.nn.MSELoss(reduce=True, size_average=True)
+    INFO(critic)
+    INFO(critic_mse)
+
+    if Constants.USE_GPU:
+        discriminator.cuda()
+        critic = critic.cuda()
+        critic_mse = critic_mse.cuda()
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    # 4. Build optimizer
+    INFO('Building Optimizer...')
+    optim = Optimizer(name=optimizer_configs['optimizer'],
+                      model=discriminator,
+                      lr=lrate,
+                      grad_clip=optimizer_configs['grad_clip'],
+                      weight_decay=optimizer_configs['weight_decay'],
+                      optim_args=optimizer_configs['optimizer_params']
+                      )
+
+    # 5. Build scheduler for optimizer if needed
+    if optimizer_configs['schedule_method'] is not None:
+        scheduler = build_scheduler(schedule_method=optimizer_configs['schedule_method'],
+                                    optimizer=optim, scheduler_configs=optimizer_configs['scheduler_configs'])
+    else:
+        scheduler = None
+
+
+    # 6. build moving average
+    ma = None
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    eidx = model_collections.get_collection("eidx", [0])[-1]
+    uidx = model_collections.get_collection("uidx", [0])[-1]
+    bad_count = model_collections.get_collection("bad_count", [0])[-1]
+    oom_count = model_collections.get_collection("oom_count", [0])[-1]
+
+    summary_writer = SummaryWriter(log_dir=flags.log_path)
+
+    cum_samples = 0
+    cum_words = 0
+
+    # Timer for computing speed
+    timer_for_speed = Timer()
+    timer_for_speed.tic()
+
+    INFO('Begin training...')
+
+    loss_dict = {
+        'normal_train_eval':{'loss_word':[], 'loss_hter':[], 'f1_ok':[], 'f1_bad':[], 'f1_multi':[], 'pearsonr':[]},
+        'val_eval':  {'loss_word':[], 'loss_hter':[], 'f1_ok':[], 'f1_bad':[], 'f1_multi':[], 'pearsonr':[]},
+    }
+
+    save_id = 0
+
+    while True:
+        
+        # =========================================== 训练前测试 ================================================ #
+        """
+        valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p = \
+            loss_evaluation_qe(discriminator=discriminator,
+                                critic=critic,
+                                critic_mse=critic_mse,
+                                valid_iterator=valid_iterator)
+
+        normal_train_loss, normal_train_loss_hter, normal_train_f1good, normal_train_f1bad, normal_train_f1multi, normal_train_p = \
+            loss_evaluation_qe(discriminator=discriminator,
+                                critic=critic,
+                                critic_mse=critic_mse,
+                                valid_iterator=normal_train_iterator)
+
+        # 保存 loss记录
+        loss_dict['val_eval']['loss_word'].append(valid_loss)
+        loss_dict['val_eval']['loss_hter'].append(valid_loss_hter)
+        loss_dict['val_eval']['f1_ok'].append(f1good)
+        loss_dict['val_eval']['f1_bad'].append(f1bad)
+        loss_dict['val_eval']['f1_multi'].append(f1multi)
+        loss_dict['val_eval']['pearsonr'].append(p)
+
+        loss_dict['normal_train_eval']['loss_word'].append(normal_train_loss)
+        loss_dict['normal_train_eval']['loss_hter'].append(normal_train_loss_hter)
+        loss_dict['normal_train_eval']['f1_ok'].append(normal_train_f1good)
+        loss_dict['normal_train_eval']['f1_bad'].append(normal_train_f1bad)
+        loss_dict['normal_train_eval']['f1_multi'].append(normal_train_f1multi)
+        loss_dict['normal_train_eval']['pearsonr'].append(normal_train_p)
+        """
+        # =========================================== 训练前测试结束 ================================================ #
+
+        summary_writer.add_scalar("Epoch", (eidx + 1), uidx)
+        # Build iterator and progress bar
+        training_iter = training_iterator.build_generator()
+        training_progress_bar = tqdm(desc='  - (Epoch %d)   ' % eidx,
+                                     total=len(training_iterator),
+                                     unit="sents")
+        train_loss = 0
+        train_loss_hter = 0
+
+        id = 0
+        for batch in training_iter:
+            discriminator.eval()
+            uidx += 1
+            if optimizer_configs["schedule_method"] is not None and optimizer_configs["schedule_method"] != "loss":
+                scheduler.step(global_step=uidx)
+
+            seqs_x, seqs_y, xy_label, xy_hter, train_idx = batch
+
+            n_samples_t = len(seqs_x)
+            n_words_t = sum(len(s) for s in seqs_y)
+            cum_samples += n_samples_t
+            cum_words += n_words_t
+            training_progress_bar.update(n_samples_t)
+
+            x, y, xy_label = prepare_data_qe(seqs_x, seqs_y, xy_label, cuda=Constants.USE_GPU)
+
+            if Constants.USE_GPU:
+                xy_hter = torch.tensor(xy_hter).cuda()
+                train_idx = torch.tensor(train_idx).cuda().int().squeeze(0).squeeze(0)
+
+            token_mask = torch.zeros_like(xy_label)[:, 2:-1]
+            for idx in train_idx:
+                token_mask[0, idx] = 1
+
+            if flags.add_feature:
+                loss, loss_hter = compute_forward_discriminator_token_mask_add_feature(model=discriminator,
+                                                            critic=critic,
+                                                            critic_mse=critic_mse,
+                                                            seqs_x=x,
+                                                            seqs_y=y,
+                                                            lm_ids=xy_label,
+                                                            hter_label=xy_hter,
+                                                            token_mask=token_mask,
+                                                            margin=margin,
+                                                            align_line=align_bpe_dict_mt2src_train[str(id)],
+                                                            )
+            else:
+                loss, loss_hter = compute_forward_discriminator_token_mask(model=discriminator,
+                                                            critic=critic,
+                                                            critic_mse=critic_mse,
+                                                            seqs_x=x,
+                                                            seqs_y=y,
+                                                            lm_ids=xy_label,
+                                                            hter_label=xy_hter,
+                                                            token_mask=token_mask,
+                                                            margin=margin,
+                                                            )
+
+            train_loss += loss
+            train_loss_hter += loss_hter
+            # --------------------------------------------
+            if (uidx) % training_configs['update_cycle'] == 0:
+                optim.step()
+                optim.zero_grad()
+
+            if ma is not None and eidx >= training_configs['moving_average_start_epoch']:
+                ma.step()
+
+            # ================================================================================== #
+            # Display some information
+            if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['disp_freq']):
+                # words per second and sents per second
+                words_per_sec = cum_words / (timer.toc(return_seconds=True))
+                sents_per_sec = cum_samples / (timer.toc(return_seconds=True))
+                lrate = list(optim.get_lrate())[0]
+
+                summary_writer.add_scalar("Speed(words/sec)", scalar_value=words_per_sec, global_step=uidx)
+                summary_writer.add_scalar("Speed(sents/sen)", scalar_value=sents_per_sec, global_step=uidx)
+                summary_writer.add_scalar("lrate", scalar_value=lrate, global_step=uidx)
+                summary_writer.add_scalar("oom_count", scalar_value=oom_count, global_step=uidx)
+                INFO("{0} TrainLoss: {1:.4f} TrainLoss_hter: {2:.4f} ".format(
+                    uidx, train_loss / training_configs['disp_freq'], train_loss_hter / training_configs['disp_freq']
+                ))
+
+                # Reset timer
+                timer.tic()
+                cum_words = 0
+                cum_samples = 0
+                train_loss = 0
+                train_loss_hter = 0
+
+            # ================================================================================== #
+            # Saving checkpoints
+            if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['save_freq'], debug=flags.debug):
+                model_collections.add_to_collection("uidx", uidx)
+                model_collections.add_to_collection("eidx", eidx)
+                model_collections.add_to_collection("bad_count", bad_count)
+
+            # ================================================================================== #
+            # Loss Validation & Learning rate annealing
+            if should_trigger_by_steps(global_step=uidx, n_epoch=eidx, every_n_step=training_configs['loss_valid_freq'],
+                                       debug=flags.debug):
+
+                if flags.add_feature:
+                    valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p = \
+                        loss_evaluation_qe_add_feature(discriminator=discriminator,
+                                                    critic=critic,
+                                                    critic_mse=critic_mse,
+                                                    valid_iterator=valid_iterator,
+                                                    align_dict=align_bpe_dict_mt2src_dev,)
+                else:
+                    valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p = \
+                        loss_evaluation_qe(discriminator=discriminator,
+                                        critic=critic,
+                                        critic_mse=critic_mse,
+                                        valid_iterator=valid_iterator,)
+                """
+                normal_train_loss, normal_train_loss_hter, normal_train_f1good, normal_train_f1bad, normal_train_f1multi, normal_train_p = \
+                    loss_evaluation_qe(discriminator=discriminator,
+                                        critic=critic,
+                                        critic_mse=critic_mse,
+                                        valid_iterator=normal_train_iterator,
+                                        requires_adapter=False)
+
+                # 保存 loss记录
+                loss_dict['val_eval']['loss_word'].append(valid_loss)
+                loss_dict['val_eval']['loss_hter'].append(valid_loss_hter)
+                loss_dict['val_eval']['f1_ok'].append(f1good)
+                loss_dict['val_eval']['f1_bad'].append(f1bad)
+                loss_dict['val_eval']['f1_multi'].append(f1multi)
+                loss_dict['val_eval']['pearsonr'].append(p)
+
+                loss_dict['normal_train_eval']['loss_word'].append(normal_train_loss)
+                loss_dict['normal_train_eval']['loss_hter'].append(normal_train_loss_hter)
+                loss_dict['normal_train_eval']['f1_ok'].append(normal_train_f1good)
+                loss_dict['normal_train_eval']['f1_bad'].append(normal_train_f1bad)
+                loss_dict['normal_train_eval']['f1_multi'].append(normal_train_f1multi)
+                loss_dict['normal_train_eval']['pearsonr'].append(normal_train_p)
+                """
+
+                # 保存ckpt
+                torch.save(discriminator.state_dict(), best_model_prefix + '.ckpt.' + str(uidx))
+                #torch.save(discriminator.state_dict(), best_model_prefix + '.last_ckpt')
+                #"""
+                model_collections.add_to_collection("history_losses", valid_loss)   # 用词级别loss保存
+                # model_collections.add_to_collection("history_losses", valid_loss_hter)  # 用句子级loss保存
+                min_loss = np.array(model_collections.get_collection("history_losses")).min()
+
+                if valid_loss <= min_loss:   # 用词级别loss保存
+                # if valid_loss_hter <= min_loss:  # 用句子级loss保存
+                    bad_count = 0
+                    if is_early_stop is False:
+                        # 1. save the best model
+                        torch.save(discriminator.state_dict(), best_model_prefix + ".final")
+                        #torch.save(discriminator.state_dict(), best_model_prefix + "." + str(save_id))
+                        #INFO("save model id: {0}".format(save_id))
+                        #save_id += 1
+                else:
+                    bad_count += 1
+                    # At least one epoch should be traversed
+                    if bad_count >= training_configs['early_stop_patience'] and eidx >= training_configs["min_epochs"]:
+                        is_early_stop = True
+                        WARN("Early Stop!")
+
+                summary_writer.add_scalar("bad_count", bad_count, uidx)
+
+                INFO("{0} Loss: {1:.2f} Loss_hter: {2:.4f} F1_good: {3:.4f} F1_bad: {4:.4f} "
+                     "F1_multi: {5:.4f} pearsonr:{6:.2f} patience: {7}".
+                     format(uidx, valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p, bad_count))
+            if is_early_stop is True:
+                break
+            
+            id += 1
+
+        if is_early_stop is True:
+            break
+        training_progress_bar.close()
+
+        eidx += 1
+        if eidx > training_configs["max_epochs"]:
+            break
+    """
+    with open(flags.saveto + '/loss_dict.json', 'w', encoding='utf-8') as f:
+        json.dump(loss_dict, f, indent=1)
+    """
+
+
+def finetune_qe_token_mask_every_sample(flags):
+    # 训练时只关注没被mask的token来训练，别的不管
+    # 一组对抗样本学会了，再进行下一组
+    """
+    FLAGS:
+        saveto: str
+        reload: store_true
+        config_path: str
+        pretrain_path: str, default=""
+        model_name: str
+        log_path: str
+    """
+
+    # write log of training to file.
+    write_log_to_file(os.path.join(flags.log_path, "%s.log" % time.strftime("%Y%m%d-%H%M%S")))
+    Constants.USE_GPU = flags.use_gpu
+    config_path = os.path.abspath(flags.config_path)
+    with open(config_path.strip()) as f:
+        configs = yaml.safe_load(f)
+    INFO(pretty_configs(configs))
+    # Add default configs
+    configs = prepare_configs(flags.config_path, flags.predefined_config)
+    discriminator_model_configs = configs['discriminator_configs']
+    data_configs = configs['data_configs']
+    optimizer_configs = configs['optimizer_configs']
+    training_configs = configs['training_configs']
+
+    Constants.SEED = training_configs['seed']
+    # Constants.SEED = flags.seed
+
+    set_seed(Constants.SEED)
+
+    best_model_prefix = os.path.join(flags.saveto,
+                                     flags.model_name + Constants.MY_BEST_MODEL_SUFFIX)
+    timer = Timer()
+
+    # ================================================================================== #
+    # Load Data
+
+    INFO('Loading data...')
+    timer.tic()
+
+    with open(flags.sample_seg_path, 'r', encoding='utf-8') as f:
+        robust_sample_seg = json.load(f)
+
+    # Generate target dictionary
+    vocab_src = Vocabulary.build_from_file(**data_configs['vocabularies'][0])
+    vocab_tgt = Vocabulary.build_from_file(**data_configs['vocabularies'][1])
+
+    train_batch_size = training_configs["batch_size"]
+    train_buffer_size = training_configs["buffer_size"]
+
+    train_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['train_data'][0],
+                        vocabulary=vocab_src,
+                        max_len=data_configs['max_len'][0],
+                        ),
+        TextLineDataset(data_path=data_configs['train_data'][1],
+                        vocabulary=vocab_tgt,
+                        max_len=data_configs['max_len'][1],
+                        ),
+        QETagsDataset(data_path=data_configs['train_data'][2],
+                      max_len=data_configs['max_len'][1]
+                      ),
+        QEHterDataset(data_path=data_configs['train_data'][3]),
+        QEHterDataset(data_path=data_configs['train_data'][4]),
+        QEHterDataset(data_path=data_configs['train_data'][5]),
+    )
+
+    valid_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['valid_data'][0],
+                        vocabulary=vocab_src,
+                        ),
+        TextLineDataset(data_path=data_configs['valid_data'][1],
+                        vocabulary=vocab_tgt,
+                        ),
+        QETagsDataset(data_path=data_configs['valid_data'][2]),
+        QEHterDataset(data_path=data_configs['valid_data'][3])
+    )
+
+    training_iterator = DataIterator(dataset=train_bitext_dataset,
+                                     batch_size=train_batch_size,
+                                     use_bucket=training_configs['use_bucket'],
+                                     buffer_size=train_buffer_size,
+                                     batching_func=training_configs['batching_key'],
+                                     shuffle=False)
+
+    valid_iterator = DataIterator(dataset=valid_bitext_dataset,
+                                  batch_size=training_configs['valid_batch_size'],
+                                  use_bucket=False, numbering=False,
+                                  shuffle=True)
+    
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    lrate = optimizer_configs['learning_rate']
+    is_early_stop = False
+
+    # ================================ Begin ======================================== #
+    # Build Model & Optimizer
+    # We would do steps below on after another
+    #     0. load transformer
+    #     1. build models & criterion
+    #     2. move models & criterion to gpu if needed
+    #     3. load pre-trained model if needed
+    #     4. build optimizer
+    #     5. build learning rate scheduler if needed
+    #     6. load checkpoints if needed
+
+    # 00. Initial
+    model_collections = Collections()
+
+    # 0. load transformer
+    INFO('Building transformer model...')
+    timer.tic()
+    discriminator = build_model(n_src_vocab=vocab_src.max_n_words,
+                                n_tgt_vocab=vocab_tgt.max_n_words, **discriminator_model_configs)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    INFO('Reloading model parameters...')
+    timer.tic()
+    # 加载之前训好的模型参数
+    #params = load_model_parameters(flags.pretrain_path, map_location="cpu")
+    #discriminator.load_state_dict(params)
+    # 如果有训好的，才加载
+    load_pretrained_model(discriminator, flags.pretrain_path, exclude_prefix=None,
+                          device="cpu")
+    
+    margin = False
+    if flags.criterion == "focal_loss":
+        critic = NMTCriterionFocalLoss(padding_idx=0, ignore_idx=0)
+    elif flags.criterion == "nll_loss":
+        critic = NMTCriterion(padding_idx=0, ignore_idx=0)
+    elif flags.criterion == "margin_loss":
+        critic = NMTCriterionMarginLoss(padding_idx=0, ignore_idx=0)
+        margin = True
+
+    critic_mse = torch.nn.MSELoss(reduce=True, size_average=True)
+    INFO(critic)
+    INFO(critic_mse)
+
+    if Constants.USE_GPU:
+        discriminator.cuda()
+        critic = critic.cuda()
+        critic_mse = critic_mse.cuda()
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    # 4. Build optimizer
+    INFO('Building Optimizer...')
+    optim = Optimizer(name=optimizer_configs['optimizer'],
+                      model=discriminator,
+                      lr=lrate,
+                      grad_clip=optimizer_configs['grad_clip'],
+                      weight_decay=optimizer_configs['weight_decay'],
+                      optim_args=optimizer_configs['optimizer_params']
+                      )
+
+    # 5. Build scheduler for optimizer if needed
+    if optimizer_configs['schedule_method'] is not None:
+        scheduler = build_scheduler(schedule_method=optimizer_configs['schedule_method'],
+                                    optimizer=optim, scheduler_configs=optimizer_configs['scheduler_configs'])
+    else:
+        scheduler = None
+
+
+    # 6. build moving average
+    ma = None
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    eidx = model_collections.get_collection("eidx", [0])[-1]
+    uidx = model_collections.get_collection("uidx", [0])[-1]
+    bad_count = model_collections.get_collection("bad_count", [0])[-1]
+    oom_count = model_collections.get_collection("oom_count", [0])[-1]
+
+    summary_writer = SummaryWriter(log_dir=flags.log_path)
+
+    cum_samples = 0
+    cum_words = 0
+
+    # Timer for computing speed
+    timer_for_speed = Timer()
+    timer_for_speed.tic()
+
+    INFO('Begin training...')
+
+    loss_dict = {
+        'normal_train_eval':{'loss_word':[], 'loss_hter':[], 'f1_ok':[], 'f1_bad':[], 'f1_multi':[], 'pearsonr':[]},
+        'val_eval':  {'loss_word':[], 'loss_hter':[], 'f1_ok':[], 'f1_bad':[], 'f1_multi':[], 'pearsonr':[]},
+    }
+
+    save_id = 0
+
+    robust_sample_num = len(train_bitext_dataset)
+
+    while(True):
+        summary_writer.add_scalar("Epoch", (eidx + 1), uidx)
+        training_progress_bar = tqdm(desc='  - (Epoch %d)   ' % eidx,
+                                    total=robust_sample_num,
+                                    unit="sents")
+        train_loss = 0
+        train_loss_hter = 0
+
+        # 每个普通样本，就是每组对抗样本
+        for sent_id in range(len(robust_sample_seg)):
+            robust_sent_id_begin = robust_sample_seg[str(sent_id)]['begin']
+            robust_sent_id_end = robust_sample_seg[str(sent_id)]['end']
+
+            contrast_group_dataset = []
+            for robust_sent_id in range(robust_sent_id_begin, robust_sent_id_end + 1):
+                contrast_group_dataset.append(train_bitext_dataset[robust_sent_id])
+            
+            train_time = 0
+            while(True):
+                #print("=======")
+                #print("sent_id %d" % sent_id)
+                #print("train_time %d" % train_time)
+
+                # 这组对抗样本中的每一个
+                for batch in contrast_group_dataset:
+                    uidx += 1
+                    if optimizer_configs["schedule_method"] is not None and optimizer_configs["schedule_method"] != "loss":
+                        scheduler.step(global_step=uidx)
+                    
+                    seqs_x, seqs_y, xy_label, xy_hter, train_idx, _ = batch
+                    n_samples_t = len(seqs_x)
+                    n_words_t = sum(len(s) for s in seqs_y)
+                    cum_samples += n_samples_t
+                    cum_words += n_words_t
+                    if train_time == 0: 
+                        training_progress_bar.update(n_samples_t)
+
+                    x, y, xy_label = prepare_data_qe(seqs_x, seqs_y, xy_label, cuda=Constants.USE_GPU)
+
+                    if Constants.USE_GPU:
+                        xy_hter = torch.tensor(xy_hter).cuda()
+                        train_idx = torch.tensor(train_idx).cuda().int().squeeze(0).squeeze(0)
+
+                    token_mask = torch.zeros_like(xy_label)[:, 2:-1]
+                    for idx in train_idx:
+                        token_mask[0, idx] = 1
+
+                    loss, loss_hter = compute_forward_discriminator_token_mask(model=discriminator,
+                                                                    critic=critic,
+                                                                    critic_mse=critic_mse,
+                                                                    seqs_x=x,
+                                                                    seqs_y=y,
+                                                                    lm_ids=xy_label,
+                                                                    hter_label=xy_hter,
+                                                                    token_mask=token_mask,
+                                                                    margin=margin)
+
+                    train_loss += loss
+                    train_loss_hter += loss_hter
+
+                    # --------------------------------------------
+                    if (uidx) % training_configs['update_cycle'] == 0:
+                        optim.step()
+                        optim.zero_grad()
+
+                    if ma is not None and eidx >= training_configs['moving_average_start_epoch']:
+                        ma.step()
+
+                    # ================================================================================== #
+                    # Display some information
+                    if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['disp_freq']):
+                        # words per second and sents per second
+                        words_per_sec = cum_words / (timer.toc(return_seconds=True))
+                        sents_per_sec = cum_samples / (timer.toc(return_seconds=True))
+                        lrate = list(optim.get_lrate())[0]
+
+                        summary_writer.add_scalar("Speed(words/sec)", scalar_value=words_per_sec, global_step=uidx)
+                        summary_writer.add_scalar("Speed(sents/sen)", scalar_value=sents_per_sec, global_step=uidx)
+                        summary_writer.add_scalar("lrate", scalar_value=lrate, global_step=uidx)
+                        summary_writer.add_scalar("oom_count", scalar_value=oom_count, global_step=uidx)
+                        INFO("{0} TrainLoss: {1:.4f} TrainLoss_hter: {2:.4f} ".format(
+                            uidx, train_loss / training_configs['disp_freq'], train_loss_hter / training_configs['disp_freq']
+                        ))
+
+                        # Reset timer
+                        timer.tic()
+                        cum_words = 0
+                        cum_samples = 0
+                        train_loss = 0
+                        train_loss_hter = 0
+
+                    # ================================================================================== #
+                    # Saving checkpoints
+                    if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['save_freq'], debug=flags.debug):
+                        model_collections.add_to_collection("uidx", uidx)
+                        model_collections.add_to_collection("eidx", eidx)
+                        model_collections.add_to_collection("bad_count", bad_count)
+
+                    # ================================================================================== #
+                    # Loss Validation & Learning rate annealing
+                    if should_trigger_by_steps(global_step=uidx, n_epoch=eidx, every_n_step=training_configs['loss_valid_freq'],
+                                            debug=flags.debug):
+
+                        valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p = \
+                            loss_evaluation_qe(discriminator=discriminator,
+                                            critic=critic,
+                                            critic_mse=critic_mse,
+                                            valid_iterator=valid_iterator,)
+
+                        # 保存ckpt
+                        torch.save(discriminator.state_dict(), best_model_prefix + '.ckpt.' + str(uidx))
+                        #"""
+                        model_collections.add_to_collection("history_losses", valid_loss)   # 用词级别loss保存
+                        min_loss = np.array(model_collections.get_collection("history_losses")).min()
+
+                        if valid_loss <= min_loss:   # 用词级别loss保存
+                            bad_count = 0
+                            if is_early_stop is False:
+                                # 1. save the best model
+                                torch.save(discriminator.state_dict(), best_model_prefix + ".final")
+
+                        else:
+                            bad_count += 1
+                            # At least one epoch should be traversed
+                            if bad_count >= training_configs['early_stop_patience'] and eidx >= training_configs["min_epochs"]:
+                                is_early_stop = True
+                                WARN("Early Stop!")
+
+                        summary_writer.add_scalar("bad_count", bad_count, uidx)
+
+                        INFO("{0} Loss: {1:.2f} Loss_hter: {2:.4f} F1_good: {3:.4f} F1_bad: {4:.4f} "
+                            "F1_multi: {5:.4f} pearsonr:{6:.2f} patience: {7}".
+                            format(uidx, valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p, bad_count))
+                    if is_early_stop is True:
+                        break
+                    
+                    #print("here")
+
+                if is_early_stop is True:
+                    break
+
+                # 检验一组样本的成果，通过就break
+                # TODO
+                acc = cal_contrast_group(model=discriminator, 
+                                        dataset=contrast_group_dataset,
+                                        critic=critic,
+                                        critic_mse=critic_mse,)
+                
+                #print(acc)
+                if acc >= 0.8:
+                    break
+                train_time += 1
+
+            if is_early_stop is True:
+                break
+        if is_early_stop is True:
+            break
+        training_progress_bar.close()
+        eidx += 1
+        if eidx > training_configs["max_epochs"]:
+            break
+
+     
+
+def finetune_qe_token_mask_align_attn_v1(flags):
+    # 训练时只关注没被mask的token来训练，别的不管
+    # 隐式+显式 = 显式，既有隐式对比数据增强，又有显式融入词对齐信息到attn矩阵
+    """
+    FLAGS:
+        saveto: str
+        reload: store_true
+        config_path: str
+        pretrain_path: str, default=""
+        model_name: str
+        log_path: str
+    """
+
+    # write log of training to file.
+    write_log_to_file(os.path.join(flags.log_path, "%s.log" % time.strftime("%Y%m%d-%H%M%S")))
+    Constants.USE_GPU = flags.use_gpu
+    config_path = os.path.abspath(flags.config_path)
+    with open(config_path.strip()) as f:
+        configs = yaml.safe_load(f)
+    INFO(pretty_configs(configs))
+    # Add default configs
+    configs = prepare_configs(flags.config_path, flags.predefined_config)
+    discriminator_model_configs = configs['discriminator_configs']
+    data_configs = configs['data_configs']
+    optimizer_configs = configs['optimizer_configs']
+    training_configs = configs['training_configs']
+
+    Constants.SEED = training_configs['seed']
+    # Constants.SEED = flags.seed
+
+    set_seed(Constants.SEED)
+
+    best_model_prefix = os.path.join(flags.saveto,
+                                     flags.model_name + Constants.MY_BEST_MODEL_SUFFIX)
+    timer = Timer()
+
+    # ================================================================================== #
+    # Load Data
+
+    INFO('Loading data...')
+    timer.tic()
+
+    # Generate target dictionary
+    vocab_src = Vocabulary.build_from_file(**data_configs['vocabularies'][0])
+    vocab_tgt = Vocabulary.build_from_file(**data_configs['vocabularies'][1])
+
+    with open(flags.align_bpe_path_mt2src_train, 'r', encoding='utf-8') as falign_m2s_train, \
+        open(flags.align_bpe_path_mt2src_dev, 'r', encoding='utf-8') as falign_m2s_dev:
+        align_bpe_dict_mt2src_train = json.load(falign_m2s_train)
+        align_bpe_dict_mt2src_dev = json.load(falign_m2s_dev)
+
+    train_batch_size = training_configs["batch_size"]
+    train_buffer_size = training_configs["buffer_size"]
+
+    train_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['train_data'][0],
+                        vocabulary=vocab_src,
+                        max_len=data_configs['max_len'][0],
+                        ),
+        TextLineDataset(data_path=data_configs['train_data'][1],
+                        vocabulary=vocab_tgt,
+                        max_len=data_configs['max_len'][1],
+                        ),
+        QETagsDataset(data_path=data_configs['train_data'][2],
+                      max_len=data_configs['max_len'][1]
+                      ),
+        QEHterDataset(data_path=data_configs['train_data'][3]),
+        QEHterDataset(data_path=data_configs['train_data'][4]),
+    )
+
+    valid_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['valid_data'][0],
+                        vocabulary=vocab_src,
+                        ),
+        TextLineDataset(data_path=data_configs['valid_data'][1],
+                        vocabulary=vocab_tgt,
+                        ),
+        QETagsDataset(data_path=data_configs['valid_data'][2]),
+        QEHterDataset(data_path=data_configs['valid_data'][3])
+    )
+
+    normal_train_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['normal_train_data'][0],
+                        vocabulary=vocab_src,
+                        max_len=data_configs['max_len'][0],
+                        ),
+        TextLineDataset(data_path=data_configs['normal_train_data'][1],
+                        vocabulary=vocab_tgt,
+                        max_len=data_configs['max_len'][1],
+                        ),
+        QETagsDataset(data_path=data_configs['normal_train_data'][2],
+                      max_len=data_configs['max_len'][1]
+                      ),
+        QEHterDataset(data_path=data_configs['normal_train_data'][3]),
+    )
+
+    training_iterator = DataIterator(dataset=train_bitext_dataset,
+                                     batch_size=train_batch_size,
+                                     use_bucket=training_configs['use_bucket'],
+                                     buffer_size=train_buffer_size,
+                                     batching_func=training_configs['batching_key'],
+                                     shuffle=False)
+
+    valid_iterator = DataIterator(dataset=valid_bitext_dataset,
+                                  batch_size=training_configs['valid_batch_size'],
+                                  use_bucket=False, numbering=False,
+                                  shuffle=False)
+
+    normal_train_iterator = DataIterator(dataset=normal_train_bitext_dataset,
+                                  batch_size=training_configs['valid_batch_size'],
+                                  use_bucket=False, numbering=False,
+                                  shuffle=False)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    lrate = optimizer_configs['learning_rate']
+    is_early_stop = False
+
+    # ================================ Begin ======================================== #
+    # Build Model & Optimizer
+    # We would do steps below on after another
+    #     0. load transformer
+    #     1. build models & criterion
+    #     2. move models & criterion to gpu if needed
+    #     3. load pre-trained model if needed
+    #     4. build optimizer
+    #     5. build learning rate scheduler if needed
+    #     6. load checkpoints if needed
+
+    # 00. Initial
+    model_collections = Collections()
+
+    # 0. load transformer
+    INFO('Building transformer model...')
+    timer.tic()
+    discriminator = build_model(n_src_vocab=vocab_src.max_n_words,
+                                n_tgt_vocab=vocab_tgt.max_n_words, **discriminator_model_configs)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    INFO('Reloading model parameters...')
+    timer.tic()
+    # 加载之前训好的模型参数
+    #params = load_model_parameters(flags.pretrain_path, map_location="cpu")
+    #discriminator.load_state_dict(params)
+    # 如果有训好的，才加载
+    load_pretrained_model(discriminator, flags.pretrain_path, exclude_prefix=None,
+                          device="cpu")
+    
+    critic = NMTCriterion(padding_idx=0, ignore_idx=0)
+    critic_mse = torch.nn.MSELoss(reduce=True, size_average=True)
+    INFO(critic)
+    INFO(critic_mse)
+
+    if Constants.USE_GPU:
+        discriminator.cuda()
+        critic = critic.cuda()
+        critic_mse = critic_mse.cuda()
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    #print("==================")
+    # TODO 尝试冻结模型参数
+    #print(discriminator)
+    #assert 1==2
+    """
+    for n, param in discriminator.named_parameters():
+        #print(n)
+        param.requires_grad = False
+
+    for n, param in discriminator.named_parameters():
+        if "adapter" in n: param.requires_grad = True
+    """
+    #assert 1==2
+    # 4. Build optimizer
+    INFO('Building Optimizer...')
+    optim = Optimizer(name=optimizer_configs['optimizer'],
+                      model=discriminator,
+                      lr=lrate,
+                      grad_clip=optimizer_configs['grad_clip'],
+                      weight_decay=optimizer_configs['weight_decay'],
+                      optim_args=optimizer_configs['optimizer_params']
+                      )
+
+    # 5. Build scheduler for optimizer if needed
+    if optimizer_configs['schedule_method'] is not None:
+        scheduler = build_scheduler(schedule_method=optimizer_configs['schedule_method'],
+                                    optimizer=optim, scheduler_configs=optimizer_configs['scheduler_configs'])
+    else:
+        scheduler = None
+
+
+    # 6. build moving average
+    ma = None
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    eidx = model_collections.get_collection("eidx", [0])[-1]
+    uidx = model_collections.get_collection("uidx", [0])[-1]
+    bad_count = model_collections.get_collection("bad_count", [0])[-1]
+    oom_count = model_collections.get_collection("oom_count", [0])[-1]
+
+    summary_writer = SummaryWriter(log_dir=flags.log_path)
+
+    cum_samples = 0
+    cum_words = 0
+
+    # Timer for computing speed
+    timer_for_speed = Timer()
+    timer_for_speed.tic()
+
+    INFO('Begin training...')
+
+    loss_dict = {
+        'normal_train_eval':{'loss_word':[], 'loss_hter':[], 'f1_ok':[], 'f1_bad':[], 'f1_multi':[], 'pearsonr':[]},
+        'val_eval':  {'loss_word':[], 'loss_hter':[], 'f1_ok':[], 'f1_bad':[], 'f1_multi':[], 'pearsonr':[]},
+    }
+
+    save_id = 0
+
+    while True:
+
+        # =========================================== 训练前测试 ================================================ #
+        #"""
+        valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p = \
+            loss_evaluation_qe_align(discriminator=discriminator,
+                                       critic=critic,
+                                       critic_mse=critic_mse,
+                                       valid_iterator=valid_iterator,
+                                       align_dict=align_bpe_dict_mt2src_dev)
+
+        normal_train_loss, normal_train_loss_hter, normal_train_f1good, normal_train_f1bad, normal_train_f1multi, normal_train_p = \
+            loss_evaluation_qe(discriminator=discriminator,
+                                critic=critic,
+                                critic_mse=critic_mse,
+                                valid_iterator=normal_train_iterator)
+
+        # 保存 loss记录
+        loss_dict['val_eval']['loss_word'].append(valid_loss)
+        loss_dict['val_eval']['loss_hter'].append(valid_loss_hter)
+        loss_dict['val_eval']['f1_ok'].append(f1good)
+        loss_dict['val_eval']['f1_bad'].append(f1bad)
+        loss_dict['val_eval']['f1_multi'].append(f1multi)
+        loss_dict['val_eval']['pearsonr'].append(p)
+
+        loss_dict['normal_train_eval']['loss_word'].append(normal_train_loss)
+        loss_dict['normal_train_eval']['loss_hter'].append(normal_train_loss_hter)
+        loss_dict['normal_train_eval']['f1_ok'].append(normal_train_f1good)
+        loss_dict['normal_train_eval']['f1_bad'].append(normal_train_f1bad)
+        loss_dict['normal_train_eval']['f1_multi'].append(normal_train_f1multi)
+        loss_dict['normal_train_eval']['pearsonr'].append(normal_train_p)
+        #"""
+        # =========================================== 训练前测试结束 ================================================ #
+
+        summary_writer.add_scalar("Epoch", (eidx + 1), uidx)
+        # Build iterator and progress bar
+        training_iter = training_iterator.build_generator()
+        training_progress_bar = tqdm(desc='  - (Epoch %d)   ' % eidx,
+                                     total=len(training_iterator),
+                                     unit="sents")
+        train_loss = 0
+        train_loss_hter = 0
+
+        id = 0
+        for batch in training_iter:
+            discriminator.eval()
+            uidx += 1
+            if optimizer_configs["schedule_method"] is not None and optimizer_configs["schedule_method"] != "loss":
+                scheduler.step(global_step=uidx)
+
+            seqs_x, seqs_y, xy_label, xy_hter, train_idx = batch
+
+            n_samples_t = len(seqs_x)
+            n_words_t = sum(len(s) for s in seqs_y)
+            cum_samples += n_samples_t
+            cum_words += n_words_t
+            training_progress_bar.update(n_samples_t)
+
+            x, y, xy_label = prepare_data_qe(seqs_x, seqs_y, xy_label, cuda=Constants.USE_GPU)
+
+            if Constants.USE_GPU:
+                xy_hter = torch.tensor(xy_hter).cuda()
+                train_idx = torch.tensor(train_idx).cuda().int().squeeze(0).squeeze(0)
+
+            token_mask = torch.zeros_like(xy_label)[:, 2:-1]
+            for idx in train_idx:
+                token_mask[0, idx] = 1
+            
+            loss, loss_hter = compute_forward_discriminator_token_mask_align_v1(model=discriminator,
+                                                            critic=critic,
+                                                            critic_mse=critic_mse,
+                                                            seqs_x=x,
+                                                            seqs_y=y,
+                                                            lm_ids=xy_label,
+                                                            hter_label=xy_hter,
+                                                            token_mask=token_mask,
+                                                            align_line=align_bpe_dict_mt2src_train[str(id)])
+
+            train_loss += loss
+            train_loss_hter += loss_hter
+            # --------------------------------------------
+            if (uidx) % training_configs['update_cycle'] == 0:
+                optim.step()
+                optim.zero_grad()
+
+            if ma is not None and eidx >= training_configs['moving_average_start_epoch']:
+                ma.step()
+
+            # ================================================================================== #
+            # Display some information
+            if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['disp_freq']):
+                # words per second and sents per second
+                words_per_sec = cum_words / (timer.toc(return_seconds=True))
+                sents_per_sec = cum_samples / (timer.toc(return_seconds=True))
+                lrate = list(optim.get_lrate())[0]
+
+                summary_writer.add_scalar("Speed(words/sec)", scalar_value=words_per_sec, global_step=uidx)
+                summary_writer.add_scalar("Speed(sents/sen)", scalar_value=sents_per_sec, global_step=uidx)
+                summary_writer.add_scalar("lrate", scalar_value=lrate, global_step=uidx)
+                summary_writer.add_scalar("oom_count", scalar_value=oom_count, global_step=uidx)
+                INFO("{0} TrainLoss: {1:.4f} TrainLoss_hter: {2:.4f} ".format(
+                    uidx, train_loss / training_configs['disp_freq'], train_loss_hter / training_configs['disp_freq']
+                ))
+
+                # Reset timer
+                timer.tic()
+                cum_words = 0
+                cum_samples = 0
+                train_loss = 0
+                train_loss_hter = 0
+
+            # ================================================================================== #
+            # Saving checkpoints
+            if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['save_freq'], debug=flags.debug):
+                model_collections.add_to_collection("uidx", uidx)
+                model_collections.add_to_collection("eidx", eidx)
+                model_collections.add_to_collection("bad_count", bad_count)
+
+            # ================================================================================== #
+            # Loss Validation & Learning rate annealing
+            if should_trigger_by_steps(global_step=uidx, n_epoch=eidx, every_n_step=training_configs['loss_valid_freq'],
+                                       debug=flags.debug):
+
+                valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p = \
+                    loss_evaluation_qe_align(discriminator=discriminator,
+                                       critic=critic,
+                                       critic_mse=critic_mse,
+                                       valid_iterator=valid_iterator,
+                                       align_dict=align_bpe_dict_mt2src_dev)
+                #"""
+                normal_train_loss, normal_train_loss_hter, normal_train_f1good, normal_train_f1bad, normal_train_f1multi, normal_train_p = \
+                    loss_evaluation_qe(discriminator=discriminator,
+                                        critic=critic,
+                                        critic_mse=critic_mse,
+                                        valid_iterator=normal_train_iterator,
+                                        requires_adapter=False)
+
+                # 保存 loss记录
+                loss_dict['val_eval']['loss_word'].append(valid_loss)
+                loss_dict['val_eval']['loss_hter'].append(valid_loss_hter)
+                loss_dict['val_eval']['f1_ok'].append(f1good)
+                loss_dict['val_eval']['f1_bad'].append(f1bad)
+                loss_dict['val_eval']['f1_multi'].append(f1multi)
+                loss_dict['val_eval']['pearsonr'].append(p)
+
+                loss_dict['normal_train_eval']['loss_word'].append(normal_train_loss)
+                loss_dict['normal_train_eval']['loss_hter'].append(normal_train_loss_hter)
+                loss_dict['normal_train_eval']['f1_ok'].append(normal_train_f1good)
+                loss_dict['normal_train_eval']['f1_bad'].append(normal_train_f1bad)
+                loss_dict['normal_train_eval']['f1_multi'].append(normal_train_f1multi)
+                loss_dict['normal_train_eval']['pearsonr'].append(normal_train_p)
+                
+
+                # 保存ckpt
+                torch.save(discriminator.state_dict(), best_model_prefix + '.ckpt.' + str(uidx))
+                torch.save(discriminator.state_dict(), best_model_prefix + '.last_ckpt')
+                #"""
+                model_collections.add_to_collection("history_losses", valid_loss)   # 用词级别loss保存
+                # model_collections.add_to_collection("history_losses", valid_loss_hter)  # 用句子级loss保存
+                min_loss = np.array(model_collections.get_collection("history_losses")).min()
+
+                if valid_loss <= min_loss:   # 用词级别loss保存
+                # if valid_loss_hter <= min_loss:  # 用句子级loss保存
+                    bad_count = 0
+                    if is_early_stop is False:
+                        # 1. save the best model
+                        torch.save(discriminator.state_dict(), best_model_prefix + ".final")
+                        #torch.save(discriminator.state_dict(), best_model_prefix + "." + str(save_id))
+                        #INFO("save model id: {0}".format(save_id))
+                        #save_id += 1
+                else:
+                    bad_count += 1
+                    # At least one epoch should be traversed
+                    if bad_count >= training_configs['early_stop_patience'] and eidx > 0:
+                        is_early_stop = True
+                        WARN("Early Stop!")
+
+                summary_writer.add_scalar("bad_count", bad_count, uidx)
+
+                INFO("{0} Loss: {1:.2f} Loss_hter: {2:.4f} F1_good: {3:.4f} F1_bad: {4:.4f} "
+                     "F1_multi: {5:.4f} pearsonr:{6:.2f} patience: {7}".
+                     format(uidx, valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p, bad_count))
+            if is_early_stop is True:
+                break
+
+            id += 1
+
+        if is_early_stop is True:
+            break
+        training_progress_bar.close()
+
+        eidx += 1
+        if eidx > training_configs["max_epochs"]:
+            break
+
+    with open(flags.saveto + '/loss_dict.json', 'w', encoding='utf-8') as f:
+        json.dump(loss_dict, f, indent=1)
 
 
 def finetune_qe_align_attn_v1(flags):
@@ -10251,7 +13729,8 @@ def finetune_qe_align_attn_v1(flags):
                                                                     seqs_y=y,
                                                                     lm_ids=xy_label,
                                                                     hter_label=xy_hter,
-                                                                    align_line=align_bpe_dict_mt2src_train[str(id)])
+                                                                    align_line=align_bpe_dict_mt2src_train[str(id)],
+                                                                    align_ratio=flags.align_ratio)
 
             train_loss += loss
             train_loss_hter += loss_hter
@@ -10299,11 +13778,12 @@ def finetune_qe_align_attn_v1(flags):
                                        debug=flags.debug):
 
                 valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p = \
-                    loss_evaluation_qe_align(discriminator=discriminator,
+                    loss_evaluation_qe_align_v1(discriminator=discriminator,
                                             critic=critic,
                                             critic_mse=critic_mse,
                                             valid_iterator=valid_iterator,
-                                            align_dict=align_bpe_dict_mt2src_dev)
+                                            align_dict=align_bpe_dict_mt2src_dev,
+                                            align_ratio=flags.align_ratio)
 
                 # 保存ckpt
                 torch.save(discriminator.state_dict(), best_model_prefix + '.ckpt.' + str(uidx))
@@ -10649,6 +14129,1425 @@ def finetune_qe_align_attn_v2(flags):
             
             id += 1
 
+            if is_early_stop is True:
+                break
+        if is_early_stop is True:
+            break
+        training_progress_bar.close()
+
+        eidx += 1
+        if eidx > training_configs["max_epochs"]:
+            break
+
+
+def finetune_qe_align_attn_v3(flags):
+    """
+    给attn矩阵融入外部词对齐信息，也是显式地加进来，但是不是通过修改attn的形式，
+    而是直接把（如果有）对齐词汇的话，就把对齐词汇的词向量和 原本的词向量加在一起
+    FLAGS:
+        saveto: str
+        reload: store_true
+        config_path: str
+        pretrain_path: str, default=""
+        model_name: str
+        log_path: str
+    """
+
+    # write log of training to file.
+    write_log_to_file(os.path.join(flags.log_path, "%s.log" % time.strftime("%Y%m%d-%H%M%S")))
+    Constants.USE_GPU = flags.use_gpu
+    config_path = os.path.abspath(flags.config_path)
+    with open(config_path.strip()) as f:
+        configs = yaml.safe_load(f)
+    INFO(pretty_configs(configs))
+    # Add default configs
+    configs = prepare_configs(flags.config_path, flags.predefined_config)
+    discriminator_model_configs = configs['discriminator_configs']
+    data_configs = configs['data_configs']
+    optimizer_configs = configs['optimizer_configs']
+    training_configs = configs['training_configs']
+
+    Constants.SEED = training_configs['seed']
+    # Constants.SEED = flags.seed
+
+    set_seed(Constants.SEED)
+
+    best_model_prefix = os.path.join(flags.saveto,
+                                     flags.model_name + Constants.MY_BEST_MODEL_SUFFIX)
+    timer = Timer()
+
+    # ================================================================================== #
+    # Load Data
+
+    INFO('Loading data...')
+    timer.tic()
+
+    # Generate target dictionary
+    vocab_src = Vocabulary.build_from_file(**data_configs['vocabularies'][0])
+    vocab_tgt = Vocabulary.build_from_file(**data_configs['vocabularies'][1])
+
+    with open(flags.align_bpe_path_mt2src_train, 'r', encoding='utf-8') as falign_m2s_train, \
+        open(flags.align_bpe_path_mt2src_dev, 'r', encoding='utf-8') as falign_m2s_dev:
+        align_bpe_dict_mt2src_train = json.load(falign_m2s_train)
+        align_bpe_dict_mt2src_dev = json.load(falign_m2s_dev)
+
+    train_batch_size = training_configs["batch_size"]
+    train_buffer_size = training_configs["buffer_size"]
+
+    train_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['train_data'][0],
+                        vocabulary=vocab_src,
+                        max_len=data_configs['max_len'][0],
+                        ),
+        TextLineDataset(data_path=data_configs['train_data'][1],
+                        vocabulary=vocab_tgt,
+                        max_len=data_configs['max_len'][1],
+                        ),
+        QETagsDataset(data_path=data_configs['train_data'][2],
+                      max_len=data_configs['max_len'][1]
+                      ),
+        QEHterDataset(data_path=data_configs['train_data'][3])
+    )
+
+    valid_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['valid_data'][0],
+                        vocabulary=vocab_src,
+                        ),
+        TextLineDataset(data_path=data_configs['valid_data'][1],
+                        vocabulary=vocab_tgt,
+                        ),
+        QETagsDataset(data_path=data_configs['valid_data'][2]),
+        QEHterDataset(data_path=data_configs['valid_data'][3])
+    )
+
+    training_iterator = DataIterator(dataset=train_bitext_dataset,
+                                     batch_size=train_batch_size,
+                                     use_bucket=training_configs['use_bucket'],
+                                     buffer_size=train_buffer_size,
+                                     batching_func=training_configs['batching_key'],
+                                     shuffle=False)
+
+    valid_iterator = DataIterator(dataset=valid_bitext_dataset,
+                                  batch_size=training_configs['valid_batch_size'],
+                                  use_bucket=False, numbering=False,
+                                  shuffle=False)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    lrate = optimizer_configs['learning_rate']
+    is_early_stop = False
+
+    # ================================ Begin ======================================== #
+    # Build Model & Optimizer
+    # We would do steps below on after another
+    #     0. load transformer
+    #     1. build models & criterion
+    #     2. move models & criterion to gpu if needed
+    #     3. load pre-trained model if needed
+    #     4. build optimizer
+    #     5. build learning rate scheduler if needed
+    #     6. load checkpoints if needed
+
+    # 00. Initial
+    model_collections = Collections()
+
+    # 0. load transformer
+    INFO('Building transformer model...')
+    timer.tic()
+    discriminator = build_model(n_src_vocab=vocab_src.max_n_words,
+                                n_tgt_vocab=vocab_tgt.max_n_words, **discriminator_model_configs)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    INFO('Reloading model parameters...')
+    timer.tic()
+    # 加载之前训好的模型参数
+    #params = load_model_parameters(flags.pretrain_path, map_location="cpu")
+    #discriminator.load_state_dict(params)
+    # 如果有训好的，才加载
+    load_pretrained_model(discriminator, flags.pretrain_path, exclude_prefix=None,
+                          device="cpu")
+    
+    critic = NMTCriterion(padding_idx=0, ignore_idx=0)
+    critic_mse = torch.nn.MSELoss(reduce=True, size_average=True)
+    INFO(critic)
+    INFO(critic_mse)
+
+    if Constants.USE_GPU:
+        discriminator.cuda()
+        critic = critic.cuda()
+        critic_mse = critic_mse.cuda()
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    # 4. Build optimizer
+    INFO('Building Optimizer...')
+    optim = Optimizer(name=optimizer_configs['optimizer'],
+                      model=discriminator,
+                      lr=lrate,
+                      grad_clip=optimizer_configs['grad_clip'],
+                      weight_decay=optimizer_configs['weight_decay'],
+                      optim_args=optimizer_configs['optimizer_params']
+                      )
+
+    # 5. Build scheduler for optimizer if needed
+    if optimizer_configs['schedule_method'] is not None:
+        scheduler = build_scheduler(schedule_method=optimizer_configs['schedule_method'],
+                                    optimizer=optim, scheduler_configs=optimizer_configs['scheduler_configs'])
+    else:
+        scheduler = None
+
+    # 6. build moving average
+    ma = None
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    eidx = model_collections.get_collection("eidx", [0])[-1]
+    uidx = model_collections.get_collection("uidx", [0])[-1]
+    bad_count = model_collections.get_collection("bad_count", [0])[-1]
+    oom_count = model_collections.get_collection("oom_count", [0])[-1]
+
+    summary_writer = SummaryWriter(log_dir=flags.log_path)
+
+    cum_samples = 0
+    cum_words = 0
+
+    # Timer for computing speed
+    timer_for_speed = Timer()
+    timer_for_speed.tic()
+
+    INFO('Begin training...')
+
+    save_id = 0
+
+    while True:
+
+        summary_writer.add_scalar("Epoch", (eidx + 1), uidx)
+        # Build iterator and progress bar
+        training_iter = training_iterator.build_generator()
+        training_progress_bar = tqdm(desc='  - (Epoch %d)   ' % eidx,
+                                     total=len(training_iterator),
+                                     unit="sents")
+        train_loss = 0
+        train_loss_hter = 0
+
+        id = 0
+        for batch in training_iter:
+            # print(id)
+            discriminator.eval()
+            uidx += 1
+            if optimizer_configs["schedule_method"] is not None and optimizer_configs["schedule_method"] != "loss":
+                scheduler.step(global_step=uidx)
+
+            seqs_x, seqs_y, xy_label, xy_hter = batch
+            n_samples_t = len(seqs_x)
+            n_words_t = sum(len(s) for s in seqs_y)
+            cum_samples += n_samples_t
+            cum_words += n_words_t
+            training_progress_bar.update(n_samples_t)
+
+            x, y, xy_label = prepare_data_qe(seqs_x, seqs_y, xy_label, cuda=Constants.USE_GPU)
+
+            if Constants.USE_GPU:
+                xy_hter = torch.tensor(xy_hter)
+                xy_hter = xy_hter.cuda()
+
+            loss, loss_hter = compute_forward_discriminator_align_v3(model=discriminator,
+                                                                    critic=critic,
+                                                                    critic_mse=critic_mse,
+                                                                    seqs_x=x,
+                                                                    seqs_y=y,
+                                                                    lm_ids=xy_label,
+                                                                    hter_label=xy_hter,
+                                                                    align_line=align_bpe_dict_mt2src_train[str(id)],
+                                                                    attn_align_lambda=flags.attn_align_lambda,)
+
+            train_loss += loss
+            train_loss_hter += loss_hter
+            # --------------------------------------------
+            if (uidx) % training_configs['update_cycle'] == 0:
+                optim.step()
+                optim.zero_grad()
+
+            if ma is not None and eidx >= training_configs['moving_average_start_epoch']:
+                ma.step()
+
+            # ================================================================================== #
+            # Display some information
+            if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['disp_freq']):
+                # words per second and sents per second
+                words_per_sec = cum_words / (timer.toc(return_seconds=True))
+                sents_per_sec = cum_samples / (timer.toc(return_seconds=True))
+                lrate = list(optim.get_lrate())[0]
+
+                summary_writer.add_scalar("Speed(words/sec)", scalar_value=words_per_sec, global_step=uidx)
+                summary_writer.add_scalar("Speed(sents/sen)", scalar_value=sents_per_sec, global_step=uidx)
+                summary_writer.add_scalar("lrate", scalar_value=lrate, global_step=uidx)
+                summary_writer.add_scalar("oom_count", scalar_value=oom_count, global_step=uidx)
+                INFO("{0} TrainLoss: {1:.4f} TrainLoss_hter: {2:.4f} ".format(
+                    uidx, train_loss / training_configs['disp_freq'], train_loss_hter / training_configs['disp_freq']
+                ))
+
+                # Reset timer
+                timer.tic()
+                cum_words = 0
+                cum_samples = 0
+                train_loss = 0
+                train_loss_hter = 0
+
+            # ================================================================================== #
+            # Saving checkpoints
+            if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['save_freq'], debug=flags.debug):
+                model_collections.add_to_collection("uidx", uidx)
+                model_collections.add_to_collection("eidx", eidx)
+                model_collections.add_to_collection("bad_count", bad_count)
+
+            # ================================================================================== #
+            # Loss Validation & Learning rate annealing
+            if should_trigger_by_steps(global_step=uidx, n_epoch=eidx, every_n_step=training_configs['loss_valid_freq'],
+                                       debug=flags.debug):
+
+                valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p = \
+                    loss_evaluation_qe_align_v3(discriminator=discriminator,
+                                            critic=critic,
+                                            critic_mse=critic_mse,
+                                            valid_iterator=valid_iterator,
+                                            align_dict=align_bpe_dict_mt2src_dev,
+                                            attn_align_lambda=flags.attn_align_lambda,)
+
+                # 保存ckpt
+                torch.save(discriminator.state_dict(), best_model_prefix + '.ckpt.' + str(uidx))
+                torch.save(discriminator.state_dict(), best_model_prefix + '.last_ckpt')
+
+                model_collections.add_to_collection("history_losses", valid_loss)   # 用词级别loss保存
+                # model_collections.add_to_collection("history_losses", valid_loss_hter)  # 用句子级loss保存
+                min_loss = np.array(model_collections.get_collection("history_losses")).min()
+
+                if valid_loss <= min_loss:   # 用词级别loss保存
+                # if valid_loss_hter <= min_loss:  # 用句子级loss保存
+                    bad_count = 0
+                    if is_early_stop is False:
+                        # 1. save the best model
+                        torch.save(discriminator.state_dict(), best_model_prefix + ".final")
+                        #torch.save(discriminator.state_dict(), best_model_prefix + "." + str(save_id))
+                        #INFO("save model id: {0}".format(save_id))
+                        #save_id += 1
+                else:
+                    bad_count += 1
+                    # At least one epoch should be traversed
+                    if bad_count >= training_configs['early_stop_patience'] and eidx > 0:
+                        is_early_stop = True
+                        WARN("Early Stop!")
+
+                summary_writer.add_scalar("bad_count", bad_count, uidx)
+
+                INFO("{0} Loss: {1:.2f} Loss_hter: {2:.4f} F1_good: {3:.4f} F1_bad: {4:.4f} "
+                     "F1_multi: {5:.4f} pearsonr:{6:.2f} patience: {7}".
+                     format(uidx, valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p, bad_count))
+            if is_early_stop is True:
+                break
+            
+            id += 1
+
+        if is_early_stop is True:
+            break
+        training_progress_bar.close()
+
+        eidx += 1
+        if eidx > training_configs["max_epochs"]:
+            break
+
+
+def finetune_qe_add_feature(flags):
+    """
+    加特征
+    FLAGS:
+        saveto: str
+        reload: store_true
+        config_path: str
+        pretrain_path: str, default=""
+        model_name: str
+        log_path: str
+    """
+
+    # write log of training to file.
+    write_log_to_file(os.path.join(flags.log_path, "%s.log" % time.strftime("%Y%m%d-%H%M%S")))
+    Constants.USE_GPU = flags.use_gpu
+    config_path = os.path.abspath(flags.config_path)
+    with open(config_path.strip()) as f:
+        configs = yaml.safe_load(f)
+    INFO(pretty_configs(configs))
+    # Add default configs
+    configs = prepare_configs(flags.config_path, flags.predefined_config)
+    discriminator_model_configs = configs['discriminator_configs']
+    data_configs = configs['data_configs']
+    optimizer_configs = configs['optimizer_configs']
+    training_configs = configs['training_configs']
+
+    Constants.SEED = training_configs['seed']
+    # Constants.SEED = flags.seed
+
+    set_seed(Constants.SEED)
+
+    best_model_prefix = os.path.join(flags.saveto,
+                                     flags.model_name + Constants.MY_BEST_MODEL_SUFFIX)
+    timer = Timer()
+
+    # ================================================================================== #
+    # Load Data
+
+    INFO('Loading data...')
+    timer.tic()
+
+    # Generate target dictionary
+    vocab_src = Vocabulary.build_from_file(**data_configs['vocabularies'][0])
+    vocab_tgt = Vocabulary.build_from_file(**data_configs['vocabularies'][1])
+
+    with open(flags.align_bpe_path_mt2src_train, 'r', encoding='utf-8') as falign_m2s_train, \
+        open(flags.align_bpe_path_mt2src_dev, 'r', encoding='utf-8') as falign_m2s_dev:
+        align_bpe_dict_mt2src_train = json.load(falign_m2s_train)
+        align_bpe_dict_mt2src_dev = json.load(falign_m2s_dev)
+
+    train_batch_size = training_configs["batch_size"]
+    train_buffer_size = training_configs["buffer_size"]
+
+    train_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['train_data'][0],
+                        vocabulary=vocab_src,
+                        max_len=data_configs['max_len'][0],
+                        ),
+        TextLineDataset(data_path=data_configs['train_data'][1],
+                        vocabulary=vocab_tgt,
+                        max_len=data_configs['max_len'][1],
+                        ),
+        QETagsDataset(data_path=data_configs['train_data'][2],
+                      max_len=data_configs['max_len'][1]
+                      ),
+        QEHterDataset(data_path=data_configs['train_data'][3])
+    )
+
+    valid_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['valid_data'][0],
+                        vocabulary=vocab_src,
+                        ),
+        TextLineDataset(data_path=data_configs['valid_data'][1],
+                        vocabulary=vocab_tgt,
+                        ),
+        QETagsDataset(data_path=data_configs['valid_data'][2]),
+        QEHterDataset(data_path=data_configs['valid_data'][3])
+    )
+
+    training_iterator = DataIterator(dataset=train_bitext_dataset,
+                                     batch_size=train_batch_size,
+                                     use_bucket=training_configs['use_bucket'],
+                                     buffer_size=train_buffer_size,
+                                     batching_func=training_configs['batching_key'],
+                                     shuffle=False)
+
+    valid_iterator = DataIterator(dataset=valid_bitext_dataset,
+                                  batch_size=training_configs['valid_batch_size'],
+                                  use_bucket=False, numbering=False,
+                                  shuffle=False)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    lrate = optimizer_configs['learning_rate']
+    is_early_stop = False
+
+    # ================================ Begin ======================================== #
+    # Build Model & Optimizer
+    # We would do steps below on after another
+    #     0. load transformer
+    #     1. build models & criterion
+    #     2. move models & criterion to gpu if needed
+    #     3. load pre-trained model if needed
+    #     4. build optimizer
+    #     5. build learning rate scheduler if needed
+    #     6. load checkpoints if needed
+
+    # 00. Initial
+    model_collections = Collections()
+
+    # 0. load transformer
+    INFO('Building transformer model...')
+    timer.tic()
+    discriminator = build_model(n_src_vocab=vocab_src.max_n_words,
+                                n_tgt_vocab=vocab_tgt.max_n_words, **discriminator_model_configs)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    INFO('Reloading model parameters...')
+    timer.tic()
+    # 加载之前训好的模型参数
+    #params = load_model_parameters(flags.pretrain_path, map_location="cpu")
+    #discriminator.load_state_dict(params)
+    # 如果有训好的，才加载
+    load_pretrained_model(discriminator, flags.pretrain_path, exclude_prefix=None,
+                          device="cpu")
+    
+    critic = NMTCriterion(padding_idx=0, ignore_idx=0)
+    critic_mse = torch.nn.MSELoss(reduce=True, size_average=True)
+    INFO(critic)
+    INFO(critic_mse)
+
+    if Constants.USE_GPU:
+        discriminator.cuda()
+        critic = critic.cuda()
+        critic_mse = critic_mse.cuda()
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    # 4. Build optimizer
+    INFO('Building Optimizer...')
+    optim = Optimizer(name=optimizer_configs['optimizer'],
+                      model=discriminator,
+                      lr=lrate,
+                      grad_clip=optimizer_configs['grad_clip'],
+                      weight_decay=optimizer_configs['weight_decay'],
+                      optim_args=optimizer_configs['optimizer_params']
+                      )
+
+    # 5. Build scheduler for optimizer if needed
+    if optimizer_configs['schedule_method'] is not None:
+        scheduler = build_scheduler(schedule_method=optimizer_configs['schedule_method'],
+                                    optimizer=optim, scheduler_configs=optimizer_configs['scheduler_configs'])
+    else:
+        scheduler = None
+
+    # 6. build moving average
+    ma = None
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    eidx = model_collections.get_collection("eidx", [0])[-1]
+    uidx = model_collections.get_collection("uidx", [0])[-1]
+    bad_count = model_collections.get_collection("bad_count", [0])[-1]
+    oom_count = model_collections.get_collection("oom_count", [0])[-1]
+
+    summary_writer = SummaryWriter(log_dir=flags.log_path)
+
+    cum_samples = 0
+    cum_words = 0
+
+    # Timer for computing speed
+    timer_for_speed = Timer()
+    timer_for_speed.tic()
+
+    INFO('Begin training...')
+
+    save_id = 0
+
+    while True:
+
+        summary_writer.add_scalar("Epoch", (eidx + 1), uidx)
+        # Build iterator and progress bar
+        training_iter = training_iterator.build_generator()
+        training_progress_bar = tqdm(desc='  - (Epoch %d)   ' % eidx,
+                                     total=len(training_iterator),
+                                     unit="sents")
+        train_loss = 0
+        train_loss_hter = 0
+
+        id = 0
+        for batch in training_iter:
+            # print(id)
+            discriminator.eval()
+            uidx += 1
+            if optimizer_configs["schedule_method"] is not None and optimizer_configs["schedule_method"] != "loss":
+                scheduler.step(global_step=uidx)
+
+            seqs_x, seqs_y, xy_label, xy_hter = batch
+            n_samples_t = len(seqs_x)
+            n_words_t = sum(len(s) for s in seqs_y)
+            cum_samples += n_samples_t
+            cum_words += n_words_t
+            training_progress_bar.update(n_samples_t)
+
+            x, y, xy_label = prepare_data_qe(seqs_x, seqs_y, xy_label, cuda=Constants.USE_GPU)
+
+            if Constants.USE_GPU:
+                xy_hter = torch.tensor(xy_hter)
+                xy_hter = xy_hter.cuda()
+
+            loss, loss_hter = compute_forward_discriminator_add_feature(model=discriminator,
+                                                                    critic=critic,
+                                                                    critic_mse=critic_mse,
+                                                                    seqs_x=x,
+                                                                    seqs_y=y,
+                                                                    lm_ids=xy_label,
+                                                                    hter_label=xy_hter,
+                                                                    align_line=align_bpe_dict_mt2src_train[str(id)],)
+
+            train_loss += loss
+            train_loss_hter += loss_hter
+            # --------------------------------------------
+            if (uidx) % training_configs['update_cycle'] == 0:
+                optim.step()
+                optim.zero_grad()
+
+            if ma is not None and eidx >= training_configs['moving_average_start_epoch']:
+                ma.step()
+
+            # ================================================================================== #
+            # Display some information
+            if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['disp_freq']):
+                # words per second and sents per second
+                words_per_sec = cum_words / (timer.toc(return_seconds=True))
+                sents_per_sec = cum_samples / (timer.toc(return_seconds=True))
+                lrate = list(optim.get_lrate())[0]
+
+                summary_writer.add_scalar("Speed(words/sec)", scalar_value=words_per_sec, global_step=uidx)
+                summary_writer.add_scalar("Speed(sents/sen)", scalar_value=sents_per_sec, global_step=uidx)
+                summary_writer.add_scalar("lrate", scalar_value=lrate, global_step=uidx)
+                summary_writer.add_scalar("oom_count", scalar_value=oom_count, global_step=uidx)
+                INFO("{0} TrainLoss: {1:.4f} TrainLoss_hter: {2:.4f} ".format(
+                    uidx, train_loss / training_configs['disp_freq'], train_loss_hter / training_configs['disp_freq']
+                ))
+
+                # Reset timer
+                timer.tic()
+                cum_words = 0
+                cum_samples = 0
+                train_loss = 0
+                train_loss_hter = 0
+
+            # ================================================================================== #
+            # Saving checkpoints
+            if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['save_freq'], debug=flags.debug):
+                model_collections.add_to_collection("uidx", uidx)
+                model_collections.add_to_collection("eidx", eidx)
+                model_collections.add_to_collection("bad_count", bad_count)
+
+            # ================================================================================== #
+            # Loss Validation & Learning rate annealing
+            if should_trigger_by_steps(global_step=uidx, n_epoch=eidx, every_n_step=training_configs['loss_valid_freq'],
+                                       debug=flags.debug):
+
+                valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p = \
+                    loss_evaluation_qe_add_feature(discriminator=discriminator,
+                                            critic=critic,
+                                            critic_mse=critic_mse,
+                                            valid_iterator=valid_iterator,
+                                            align_dict=align_bpe_dict_mt2src_dev,)
+
+                # 保存ckpt
+                torch.save(discriminator.state_dict(), best_model_prefix + '.ckpt.' + str(uidx))
+                torch.save(discriminator.state_dict(), best_model_prefix + '.last_ckpt')
+
+                model_collections.add_to_collection("history_losses", valid_loss)   # 用词级别loss保存
+                # model_collections.add_to_collection("history_losses", valid_loss_hter)  # 用句子级loss保存
+                min_loss = np.array(model_collections.get_collection("history_losses")).min()
+
+                if valid_loss <= min_loss:   # 用词级别loss保存
+                # if valid_loss_hter <= min_loss:  # 用句子级loss保存
+                    bad_count = 0
+                    if is_early_stop is False:
+                        # 1. save the best model
+                        torch.save(discriminator.state_dict(), best_model_prefix + ".final")
+                        #torch.save(discriminator.state_dict(), best_model_prefix + "." + str(save_id))
+                        #INFO("save model id: {0}".format(save_id))
+                        #save_id += 1
+                else:
+                    bad_count += 1
+                    # At least one epoch should be traversed
+                    if bad_count >= training_configs['early_stop_patience'] and eidx > 0:
+                        is_early_stop = True
+                        WARN("Early Stop!")
+
+                summary_writer.add_scalar("bad_count", bad_count, uidx)
+
+                INFO("{0} Loss: {1:.2f} Loss_hter: {2:.4f} F1_good: {3:.4f} F1_bad: {4:.4f} "
+                     "F1_multi: {5:.4f} pearsonr:{6:.2f} patience: {7}".
+                     format(uidx, valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p, bad_count))
+            if is_early_stop is True:
+                break
+            
+            id += 1
+
+        if is_early_stop is True:
+            break
+        training_progress_bar.close()
+
+        eidx += 1
+        if eidx > training_configs["max_epochs"]:
+            break
+
+
+def finetune_qe_align_attn_v4(flags):
+    """
+    参考【emnlp2020】Towards enhancing faithfulness for neural machine translation 的对齐训练目标，
+    训练部分attention head尽可能接近词对齐信息，使用交叉熵损失
+    代码相当冗余……
+    FLAGS:
+        saveto: str
+        reload: store_true
+        config_path: str
+        pretrain_path: str, default=""
+        model_name: str
+        log_path: str
+    """
+
+    # write log of training to file.
+    write_log_to_file(os.path.join(flags.log_path, "%s.log" % time.strftime("%Y%m%d-%H%M%S")))
+    Constants.USE_GPU = flags.use_gpu
+    config_path = os.path.abspath(flags.config_path)
+    with open(config_path.strip()) as f:
+        configs = yaml.safe_load(f)
+    INFO(pretty_configs(configs))
+    # Add default configs
+    configs = prepare_configs(flags.config_path, flags.predefined_config)
+    discriminator_model_configs = configs['discriminator_configs']
+    data_configs = configs['data_configs']
+    optimizer_configs = configs['optimizer_configs']
+    training_configs = configs['training_configs']
+
+    Constants.SEED = training_configs['seed']
+    # Constants.SEED = flags.seed
+
+    set_seed(Constants.SEED)
+
+    best_model_prefix = os.path.join(flags.saveto,
+                                     flags.model_name + Constants.MY_BEST_MODEL_SUFFIX)
+    timer = Timer()
+
+    # ================================================================================== #
+    # Load Data
+
+    INFO('Loading data...')
+    timer.tic()
+
+    # Generate target dictionary
+    vocab_src = Vocabulary.build_from_file(**data_configs['vocabularies'][0])
+    vocab_tgt = Vocabulary.build_from_file(**data_configs['vocabularies'][1])
+
+    with open(flags.align_bpe_path_mt2src_train, 'r', encoding='utf-8') as falign_m2s_train:
+        align_bpe_dict_mt2src_train = json.load(falign_m2s_train)
+
+    train_batch_size = training_configs["batch_size"]
+    train_buffer_size = training_configs["buffer_size"]
+
+    train_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['train_data'][0],
+                        vocabulary=vocab_src,
+                        max_len=data_configs['max_len'][0],
+                        ),
+        TextLineDataset(data_path=data_configs['train_data'][1],
+                        vocabulary=vocab_tgt,
+                        max_len=data_configs['max_len'][1],
+                        ),
+        QETagsDataset(data_path=data_configs['train_data'][2],
+                      max_len=data_configs['max_len'][1]
+                      ),
+        QEHterDataset(data_path=data_configs['train_data'][3])
+    )
+
+    valid_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['valid_data'][0],
+                        vocabulary=vocab_src,
+                        ),
+        TextLineDataset(data_path=data_configs['valid_data'][1],
+                        vocabulary=vocab_tgt,
+                        ),
+        QETagsDataset(data_path=data_configs['valid_data'][2]),
+        QEHterDataset(data_path=data_configs['valid_data'][3])
+    )
+
+    training_iterator = DataIterator(dataset=train_bitext_dataset,
+                                     batch_size=train_batch_size,
+                                     use_bucket=training_configs['use_bucket'],
+                                     buffer_size=train_buffer_size,
+                                     batching_func=training_configs['batching_key'],
+                                     shuffle=False)
+
+    valid_iterator = DataIterator(dataset=valid_bitext_dataset,
+                                  batch_size=training_configs['valid_batch_size'],
+                                  use_bucket=False, numbering=False,
+                                  shuffle=False)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    lrate = optimizer_configs['learning_rate']
+    is_early_stop = False
+
+    # ================================ Begin ======================================== #
+    # Build Model & Optimizer
+    # We would do steps below on after another
+    #     0. load transformer
+    #     1. build models & criterion
+    #     2. move models & criterion to gpu if needed
+    #     3. load pre-trained model if needed
+    #     4. build optimizer
+    #     5. build learning rate scheduler if needed
+    #     6. load checkpoints if needed
+
+    # 00. Initial
+    model_collections = Collections()
+
+    # 0. load transformer
+    INFO('Building transformer model...')
+    timer.tic()
+    discriminator = build_model(n_src_vocab=vocab_src.max_n_words,
+                                n_tgt_vocab=vocab_tgt.max_n_words, **discriminator_model_configs)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    INFO('Reloading model parameters...')
+    timer.tic()
+    # 加载之前训好的模型参数
+    #params = load_model_parameters(flags.pretrain_path, map_location="cpu")
+    #discriminator.load_state_dict(params)
+    # 如果有训好的，才加载
+    load_pretrained_model(discriminator, flags.pretrain_path, exclude_prefix=None,
+                          device="cpu")
+    
+    critic = NMTCriterion(padding_idx=0, ignore_idx=0)
+    critic_mse = torch.nn.MSELoss(reduce=True, size_average=True)
+    INFO(critic)
+    INFO(critic_mse)
+
+    if Constants.USE_GPU:
+        discriminator.cuda()
+        critic = critic.cuda()
+        critic_mse = critic_mse.cuda()
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    # 4. Build optimizer
+    INFO('Building Optimizer...')
+    optim = Optimizer(name=optimizer_configs['optimizer'],
+                      model=discriminator,
+                      lr=lrate,
+                      grad_clip=optimizer_configs['grad_clip'],
+                      weight_decay=optimizer_configs['weight_decay'],
+                      optim_args=optimizer_configs['optimizer_params']
+                      )
+
+    # 5. Build scheduler for optimizer if needed
+    if optimizer_configs['schedule_method'] is not None:
+        scheduler = build_scheduler(schedule_method=optimizer_configs['schedule_method'],
+                                    optimizer=optim, scheduler_configs=optimizer_configs['scheduler_configs'])
+    else:
+        scheduler = None
+
+    # 6. build moving average
+    ma = None
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    eidx = model_collections.get_collection("eidx", [0])[-1]
+    uidx = model_collections.get_collection("uidx", [0])[-1]
+    bad_count = model_collections.get_collection("bad_count", [0])[-1]
+    oom_count = model_collections.get_collection("oom_count", [0])[-1]
+
+    summary_writer = SummaryWriter(log_dir=flags.log_path)
+
+    cum_samples = 0
+    cum_words = 0
+
+    # Timer for computing speed
+    timer_for_speed = Timer()
+    timer_for_speed.tic()
+
+    INFO('Begin training...')
+
+    save_id = 0
+
+    while True:
+
+        summary_writer.add_scalar("Epoch", (eidx + 1), uidx)
+        # Build iterator and progress bar
+        training_iter = training_iterator.build_generator()
+        training_progress_bar = tqdm(desc='  - (Epoch %d)   ' % eidx,
+                                     total=len(training_iterator),
+                                     unit="sents")
+        train_loss = 0
+        train_loss_hter = 0
+
+        id = 0
+        for batch in training_iter:
+            discriminator.eval()
+            uidx += 1
+            if optimizer_configs["schedule_method"] is not None and optimizer_configs["schedule_method"] != "loss":
+                scheduler.step(global_step=uidx)
+
+            seqs_x, seqs_y, xy_label, xy_hter = batch
+
+            n_samples_t = len(seqs_x)
+            n_words_t = sum(len(s) for s in seqs_y)
+            cum_samples += n_samples_t
+            cum_words += n_words_t
+            training_progress_bar.update(n_samples_t)
+
+            x, y, xy_label = prepare_data_qe(seqs_x, seqs_y, xy_label, cuda=Constants.USE_GPU)
+
+            if Constants.USE_GPU:
+                xy_hter = torch.tensor(xy_hter)
+                xy_hter = xy_hter.cuda()
+
+            loss, loss_hter, attn_align_loss = compute_forward_discriminator_align_v4(model=discriminator,
+                                                                    critic=critic,
+                                                                    critic_mse=critic_mse,
+                                                                    seqs_x=x,
+                                                                    seqs_y=y,
+                                                                    lm_ids=xy_label,
+                                                                    hter_label=xy_hter,
+                                                                    align_line=align_bpe_dict_mt2src_train[str(id)],
+                                                                    attn_align_lambda=flags.attn_align_lambda)
+
+            train_loss += loss
+            train_loss_hter += loss_hter
+            # --------------------------------------------
+            if (uidx) % training_configs['update_cycle'] == 0:
+                optim.step()
+                optim.zero_grad()
+
+            if ma is not None and eidx >= training_configs['moving_average_start_epoch']:
+                ma.step()
+
+            # ================================================================================== #
+            # Display some information
+            if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['disp_freq']):
+                # words per second and sents per second
+                words_per_sec = cum_words / (timer.toc(return_seconds=True))
+                sents_per_sec = cum_samples / (timer.toc(return_seconds=True))
+                lrate = list(optim.get_lrate())[0]
+
+                summary_writer.add_scalar("Speed(words/sec)", scalar_value=words_per_sec, global_step=uidx)
+                summary_writer.add_scalar("Speed(sents/sen)", scalar_value=sents_per_sec, global_step=uidx)
+                summary_writer.add_scalar("lrate", scalar_value=lrate, global_step=uidx)
+                summary_writer.add_scalar("oom_count", scalar_value=oom_count, global_step=uidx)
+                INFO("{0} TrainLoss: {1:.4f} TrainLoss_hter: {2:.4f} TrainLoss_Attn_align: {3:.4f}".format(
+                    uidx, train_loss / training_configs['disp_freq'], train_loss_hter / training_configs['disp_freq'], attn_align_loss / training_configs['disp_freq']
+                ))
+
+                # Reset timer
+                timer.tic()
+                cum_words = 0
+                cum_samples = 0
+                train_loss = 0
+                train_loss_hter = 0
+
+            # ================================================================================== #
+            # Saving checkpoints
+            if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['save_freq'], debug=flags.debug):
+                model_collections.add_to_collection("uidx", uidx)
+                model_collections.add_to_collection("eidx", eidx)
+                model_collections.add_to_collection("bad_count", bad_count)
+
+            # ================================================================================== #
+            # Loss Validation & Learning rate annealing
+            if should_trigger_by_steps(global_step=uidx, n_epoch=eidx, every_n_step=training_configs['loss_valid_freq'],
+                                       debug=flags.debug):
+
+                valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p = \
+                    loss_evaluation_qe(discriminator=discriminator,
+                                       critic=critic,
+                                       critic_mse=critic_mse,
+                                       valid_iterator=valid_iterator)
+
+                # 保存ckpt
+                torch.save(discriminator.state_dict(), best_model_prefix + '.ckpt.' + str(uidx))
+                #torch.save(discriminator.state_dict(), best_model_prefix + '.last_ckpt')
+
+                model_collections.add_to_collection("history_losses", valid_loss)   # 用词级别loss保存
+                # model_collections.add_to_collection("history_losses", valid_loss_hter)  # 用句子级loss保存
+                min_loss = np.array(model_collections.get_collection("history_losses")).min()
+
+                if valid_loss <= min_loss:   # 用词级别loss保存
+                # if valid_loss_hter <= min_loss:  # 用句子级loss保存
+                    bad_count = 0
+                    if is_early_stop is False:
+                        # 1. save the best model
+                        torch.save(discriminator.state_dict(), best_model_prefix + ".final")
+                        #torch.save(discriminator.state_dict(), best_model_prefix + "." + str(save_id))
+                        #INFO("save model id: {0}".format(save_id))
+                        #save_id += 1
+                else:
+                    bad_count += 1
+                    # At least one epoch should be traversed
+                    if bad_count >= training_configs['early_stop_patience'] and eidx > 0:
+                        is_early_stop = True
+                        WARN("Early Stop!")
+
+                summary_writer.add_scalar("bad_count", bad_count, uidx)
+
+                INFO("{0} Loss: {1:.2f} Loss_hter: {2:.4f} F1_good: {3:.4f} F1_bad: {4:.4f} "
+                     "F1_multi: {5:.4f} pearsonr:{6:.2f} patience: {7}".
+                     format(uidx, valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p, bad_count))
+            
+            id += 1
+
+            if is_early_stop is True:
+                break
+        if is_early_stop is True:
+            break
+        training_progress_bar.close()
+
+        eidx += 1
+        if eidx > training_configs["max_epochs"]:
+            break
+
+
+def find_align_attn(flags):
+    """
+    寻找最接近词对齐信息的attn矩阵
+    FLAGS:
+        saveto: str
+        reload: store_true
+        config_path: str
+        pretrain_path: str, default=""
+        model_name: str
+        log_path: str
+    """
+
+    Constants.USE_GPU = flags.use_gpu
+    config_path = os.path.abspath(flags.config_path)
+    with open(config_path.strip()) as f:
+        configs = yaml.safe_load(f)
+    INFO(pretty_configs(configs))
+    # Add default configs
+    configs = prepare_configs(flags.config_path, flags.predefined_config)
+    discriminator_model_configs = configs['discriminator_configs']
+    data_configs = configs['data_configs']
+    optimizer_configs = configs['optimizer_configs']
+    training_configs = configs['training_configs']
+
+    Constants.SEED = training_configs['seed']
+    # Constants.SEED = flags.seed
+
+    set_seed(Constants.SEED)
+
+    best_model_prefix = os.path.join(flags.saveto,
+                                     flags.model_name + Constants.MY_BEST_MODEL_SUFFIX)
+    timer = Timer()
+
+    # ================================================================================== #
+    # Load Data
+
+    INFO('Loading data...')
+    timer.tic()
+
+    # Generate target dictionary
+    vocab_src = Vocabulary.build_from_file(**data_configs['vocabularies'][0])
+    vocab_tgt = Vocabulary.build_from_file(**data_configs['vocabularies'][1])
+
+    with open(flags.align_bpe_path_mt2src_train, 'r', encoding='utf-8') as falign_m2s_train:
+        align_bpe_dict_mt2src_train = json.load(falign_m2s_train)
+
+    train_batch_size = training_configs["batch_size"]
+    train_buffer_size = training_configs["buffer_size"]
+
+    train_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['train_data'][0],
+                        vocabulary=vocab_src,
+                        max_len=data_configs['max_len'][0],
+                        ),
+        TextLineDataset(data_path=data_configs['train_data'][1],
+                        vocabulary=vocab_tgt,
+                        max_len=data_configs['max_len'][1],
+                        ),
+        QETagsDataset(data_path=data_configs['train_data'][2],
+                      max_len=data_configs['max_len'][1]
+                      ),
+        QEHterDataset(data_path=data_configs['train_data'][3])
+    )
+
+    valid_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['valid_data'][0],
+                        vocabulary=vocab_src,
+                        ),
+        TextLineDataset(data_path=data_configs['valid_data'][1],
+                        vocabulary=vocab_tgt,
+                        ),
+        QETagsDataset(data_path=data_configs['valid_data'][2]),
+        QEHterDataset(data_path=data_configs['valid_data'][3])
+    )
+
+    training_iterator = DataIterator(dataset=train_bitext_dataset,
+                                     batch_size=train_batch_size,
+                                     use_bucket=training_configs['use_bucket'],
+                                     buffer_size=train_buffer_size,
+                                     batching_func=training_configs['batching_key'],
+                                     shuffle=False)
+
+    valid_iterator = DataIterator(dataset=valid_bitext_dataset,
+                                  batch_size=training_configs['valid_batch_size'],
+                                  use_bucket=False, numbering=False,
+                                  shuffle=False)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    lrate = optimizer_configs['learning_rate']
+    is_early_stop = False
+
+    # ================================ Begin ======================================== #
+    # Build Model & Optimizer
+    # We would do steps below on after another
+    #     0. load transformer
+    #     1. build models & criterion
+    #     2. move models & criterion to gpu if needed
+    #     3. load pre-trained model if needed
+    #     4. build optimizer
+    #     5. build learning rate scheduler if needed
+    #     6. load checkpoints if needed
+
+    # 00. Initial
+    model_collections = Collections()
+
+    # 0. load transformer
+    INFO('Building transformer model...')
+    timer.tic()
+    discriminator = build_model(n_src_vocab=vocab_src.max_n_words,
+                                n_tgt_vocab=vocab_tgt.max_n_words, **discriminator_model_configs)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    INFO('Reloading model parameters...')
+    timer.tic()
+    # 加载之前训好的模型参数
+    #params = load_model_parameters(flags.pretrain_path, map_location="cpu")
+    #discriminator.load_state_dict(params)
+    # 如果有训好的，才加载
+    load_pretrained_model(discriminator, flags.pretrain_path, exclude_prefix=None,
+                          device="cpu")
+    
+    if Constants.USE_GPU:
+        discriminator.cuda()
+
+    # Build iterator and progress bar
+    training_iter = training_iterator.build_generator()
+    training_progress_bar = tqdm(desc='  - (Epoch 0)   ',
+                                    total=len(training_iterator),
+                                    unit="sents")
+
+    id = 0
+    attn_align_cossim = []
+    for batch in training_iter:
+        discriminator.eval()
+        
+        seqs_x, seqs_y, xy_label, xy_hter = batch
+
+        n_samples_t = len(seqs_x)
+        training_progress_bar.update(n_samples_t)
+
+        x, y, xy_label = prepare_data_qe(seqs_x, seqs_y, xy_label, cuda=Constants.USE_GPU)
+
+        if Constants.USE_GPU:
+            xy_hter = torch.tensor(xy_hter)
+            xy_hter = xy_hter.cuda()
+
+        attn_align_cossim_one_sample = compute_attn_align_cossim(model=discriminator,
+                                                                seqs_x=x,
+                                                                seqs_y=y,
+                                                                lm_ids=xy_label,
+                                                                hter_label=xy_hter,
+                                                                align_line=align_bpe_dict_mt2src_train[str(id)])
+        attn_align_cossim.append(attn_align_cossim_one_sample)
+
+        id += 1
+        #if id > 3: break
+
+    attn_align_cossim = torch.stack(attn_align_cossim, dim = 0)
+    #print(attn_align_cossim)
+    attn_align_cossim = torch.mean(attn_align_cossim, dim = 0)  # 训练集平均下来，每个layer每个head的attn矩阵和对齐矩阵有多接近
+    #print(attn_align_cossim.size())
+    print("训练集平均下来，每个layer每个head的attn矩阵和对齐矩阵有多接近:")
+    print(attn_align_cossim)
+    attn_align_cossim_argmax = attn_align_cossim.argmax(dim = -1)    # 每层最重要的head是哪个
+    print("每层最重要的head是哪个:")
+    print(attn_align_cossim_argmax)
+
+
+def finetune_qe_robust_aug_anti(flags):
+    # 反向数据增强，增强的数据mask掉src，并动态随机生成mt标签
+    """
+    FLAGS:
+        saveto: str
+        reload: store_true
+        config_path: str
+        pretrain_path: str, default=""
+        model_name: str
+        log_path: str
+    """
+
+    # write log of training to file.
+    write_log_to_file(os.path.join(flags.log_path, "%s.log" % time.strftime("%Y%m%d-%H%M%S")))
+    Constants.USE_GPU = flags.use_gpu
+    config_path = os.path.abspath(flags.config_path)
+    with open(config_path.strip()) as f:
+        configs = yaml.safe_load(f)
+    INFO(pretty_configs(configs))
+    # Add default configs
+    configs = prepare_configs(flags.config_path, flags.predefined_config)
+    discriminator_model_configs = configs['discriminator_configs']
+    data_configs = configs['data_configs']
+    optimizer_configs = configs['optimizer_configs']
+    training_configs = configs['training_configs']
+
+    Constants.SEED = training_configs['seed']
+    # Constants.SEED = flags.seed
+
+    set_seed(Constants.SEED)
+
+    best_model_prefix = os.path.join(flags.saveto,
+                                     flags.model_name + Constants.MY_BEST_MODEL_SUFFIX)
+    timer = Timer()
+
+    # ================================================================================== #
+    # Load Data
+
+    INFO('Loading data...')
+    timer.tic()
+
+    # Generate target dictionary
+    vocab_src = Vocabulary.build_from_file(**data_configs['vocabularies'][0])
+    vocab_tgt = Vocabulary.build_from_file(**data_configs['vocabularies'][1])
+
+    train_batch_size = training_configs["batch_size"]
+    train_buffer_size = training_configs["buffer_size"]
+
+    train_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['train_data'][0],
+                        vocabulary=vocab_src,
+                        max_len=data_configs['max_len'][0],
+                        ),
+        TextLineDataset(data_path=data_configs['train_data'][1],
+                        vocabulary=vocab_tgt,
+                        max_len=data_configs['max_len'][1],
+                        ),
+        QETagsDataset(data_path=data_configs['train_data'][2],
+                      max_len=data_configs['max_len'][1]
+                      ),
+        QEHterDataset(data_path=data_configs['train_data'][3])
+    )
+
+    valid_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=data_configs['valid_data'][0],
+                        vocabulary=vocab_src,
+                        ),
+        TextLineDataset(data_path=data_configs['valid_data'][1],
+                        vocabulary=vocab_tgt,
+                        ),
+        QETagsDataset(data_path=data_configs['valid_data'][2]),
+        QEHterDataset(data_path=data_configs['valid_data'][3])
+    )
+
+    training_iterator = DataIterator(dataset=train_bitext_dataset,
+                                     batch_size=train_batch_size,
+                                     use_bucket=training_configs['use_bucket'],
+                                     buffer_size=train_buffer_size,
+                                     batching_func=training_configs['batching_key'],
+                                     shuffle=True)
+
+    valid_iterator = DataIterator(dataset=valid_bitext_dataset,
+                                  batch_size=training_configs['valid_batch_size'],
+                                  use_bucket=False, numbering=False,
+                                  shuffle=True)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    lrate = optimizer_configs['learning_rate']
+    is_early_stop = False
+
+    # ================================ Begin ======================================== #
+    # Build Model & Optimizer
+    # We would do steps below on after another
+    #     0. load transformer
+    #     1. build models & criterion
+    #     2. move models & criterion to gpu if needed
+    #     3. load pre-trained model if needed
+    #     4. build optimizer
+    #     5. build learning rate scheduler if needed
+    #     6. load checkpoints if needed
+
+    # 00. Initial
+    model_collections = Collections()
+
+    # 0. load transformer
+    INFO('Building transformer model...')
+    timer.tic()
+    discriminator = build_model(n_src_vocab=vocab_src.max_n_words,
+                                n_tgt_vocab=vocab_tgt.max_n_words, **discriminator_model_configs)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    INFO('Reloading model parameters...')
+    timer.tic()
+    # 加载之前训好的模型参数
+    #params = load_model_parameters(flags.pretrain_path, map_location="cpu")
+    #discriminator.load_state_dict(params)
+    # 如果有训好的，才加载
+    load_pretrained_model(discriminator, flags.pretrain_path, exclude_prefix=None,
+                          device="cpu")
+    
+    critic = NMTCriterion(padding_idx=0, ignore_idx=0)
+    critic_mse = torch.nn.MSELoss(reduce=True, size_average=True)
+    INFO(critic)
+    INFO(critic_mse)
+
+    if Constants.USE_GPU:
+        discriminator.cuda()
+        critic = critic.cuda()
+        critic_mse = critic_mse.cuda()
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    # 4. Build optimizer
+    INFO('Building Optimizer...')
+    optim = Optimizer(name=optimizer_configs['optimizer'],
+                      model=discriminator,
+                      lr=lrate,
+                      grad_clip=optimizer_configs['grad_clip'],
+                      weight_decay=optimizer_configs['weight_decay'],
+                      optim_args=optimizer_configs['optimizer_params']
+                      )
+
+    # 5. Build scheduler for optimizer if needed
+    if optimizer_configs['schedule_method'] is not None:
+        scheduler = build_scheduler(schedule_method=optimizer_configs['schedule_method'],
+                                    optimizer=optim, scheduler_configs=optimizer_configs['scheduler_configs'])
+    else:
+        scheduler = None
+
+    # 6. build moving average
+    ma = None
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    eidx = model_collections.get_collection("eidx", [0])[-1]
+    uidx = model_collections.get_collection("uidx", [0])[-1]
+    bad_count = model_collections.get_collection("bad_count", [0])[-1]
+    oom_count = model_collections.get_collection("oom_count", [0])[-1]
+
+    summary_writer = SummaryWriter(log_dir=flags.log_path)
+
+    cum_samples = 0
+    cum_words = 0
+
+    # Timer for computing speed
+    timer_for_speed = Timer()
+    timer_for_speed.tic()
+
+    INFO('Begin training...')
+
+    save_id = 0
+
+    while True:
+
+        summary_writer.add_scalar("Epoch", (eidx + 1), uidx)
+        # Build iterator and progress bar
+        training_iter = training_iterator.build_generator()
+        training_progress_bar = tqdm(desc='  - (Epoch %d)   ' % eidx,
+                                     total=len(training_iterator),
+                                     unit="sents")
+        train_loss = 0
+        train_loss_hter = 0
+
+        for batch in training_iter:
+            discriminator.eval()
+            uidx += 1
+            if optimizer_configs["schedule_method"] is not None and optimizer_configs["schedule_method"] != "loss":
+                scheduler.step(global_step=uidx)
+
+            seqs_x, seqs_y, xy_label, xy_hter = batch
+
+            n_samples_t = len(seqs_x)
+            n_words_t = sum(len(s) for s in seqs_y)
+            cum_samples += n_samples_t
+            cum_words += n_words_t
+            training_progress_bar.update(n_samples_t)
+
+            x, y, xy_label = prepare_data_qe(seqs_x, seqs_y, xy_label, cuda=Constants.USE_GPU)
+
+            if Constants.USE_GPU:
+                xy_hter = torch.tensor(xy_hter)
+                xy_hter = xy_hter.cuda()
+
+            loss, loss_hter = compute_forward_discriminator_robust_aug_anti(model=discriminator,
+                                                            critic=critic,
+                                                            critic_mse=critic_mse,
+                                                            seqs_x=x,
+                                                            seqs_y=y,
+                                                            lm_ids=xy_label,
+                                                            hter_label=xy_hter,
+                                                            aug_lambda=flags.aug_lambda)
+
+            train_loss += loss
+            train_loss_hter += loss_hter
+            # --------------------------------------------
+            if (uidx) % training_configs['update_cycle'] == 0:
+                optim.step()
+                optim.zero_grad()
+
+            if ma is not None and eidx >= training_configs['moving_average_start_epoch']:
+                ma.step()
+
+            # ================================================================================== #
+            # Display some information
+            if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['disp_freq']):
+                # words per second and sents per second
+                words_per_sec = cum_words / (timer.toc(return_seconds=True))
+                sents_per_sec = cum_samples / (timer.toc(return_seconds=True))
+                lrate = list(optim.get_lrate())[0]
+
+                summary_writer.add_scalar("Speed(words/sec)", scalar_value=words_per_sec, global_step=uidx)
+                summary_writer.add_scalar("Speed(sents/sen)", scalar_value=sents_per_sec, global_step=uidx)
+                summary_writer.add_scalar("lrate", scalar_value=lrate, global_step=uidx)
+                summary_writer.add_scalar("oom_count", scalar_value=oom_count, global_step=uidx)
+                INFO("{0} TrainLoss: {1:.4f} TrainLoss_hter: {2:.4f} ".format(
+                    uidx, train_loss / training_configs['disp_freq'], train_loss_hter / training_configs['disp_freq']
+                ))
+
+                # Reset timer
+                timer.tic()
+                cum_words = 0
+                cum_samples = 0
+                train_loss = 0
+                train_loss_hter = 0
+
+            # ================================================================================== #
+            # Saving checkpoints
+            if should_trigger_by_steps(uidx, eidx, every_n_step=training_configs['save_freq'], debug=flags.debug):
+                model_collections.add_to_collection("uidx", uidx)
+                model_collections.add_to_collection("eidx", eidx)
+                model_collections.add_to_collection("bad_count", bad_count)
+
+            # ================================================================================== #
+            # Loss Validation & Learning rate annealing
+            if should_trigger_by_steps(global_step=uidx, n_epoch=eidx, every_n_step=training_configs['loss_valid_freq'],
+                                       debug=flags.debug):
+
+                valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p = \
+                    loss_evaluation_qe(discriminator=discriminator,
+                                       critic=critic,
+                                       critic_mse=critic_mse,
+                                       valid_iterator=valid_iterator)
+
+                # 保存ckpt
+                torch.save(discriminator.state_dict(), best_model_prefix + '.ckpt.' + str(uidx))
+                torch.save(discriminator.state_dict(), best_model_prefix + '.last_ckpt')
+
+                model_collections.add_to_collection("history_losses", valid_loss)   # 用词级别loss保存
+                # model_collections.add_to_collection("history_losses", valid_loss_hter)  # 用句子级loss保存
+                min_loss = np.array(model_collections.get_collection("history_losses")).min()
+
+                if valid_loss <= min_loss:   # 用词级别loss保存
+                # if valid_loss_hter <= min_loss:  # 用句子级loss保存
+                    bad_count = 0
+                    if is_early_stop is False:
+                        # 1. save the best model
+                        torch.save(discriminator.state_dict(), best_model_prefix + ".final")
+                        #torch.save(discriminator.state_dict(), best_model_prefix + "." + str(save_id))
+                        #INFO("save model id: {0}".format(save_id))
+                        #save_id += 1
+                else:
+                    bad_count += 1
+                    # At least one epoch should be traversed
+                    if bad_count >= training_configs['early_stop_patience'] and eidx > 0:
+                        is_early_stop = True
+                        WARN("Early Stop!")
+
+                summary_writer.add_scalar("bad_count", bad_count, uidx)
+
+                INFO("{0} Loss: {1:.2f} Loss_hter: {2:.4f} F1_good: {3:.4f} F1_bad: {4:.4f} "
+                     "F1_multi: {5:.4f} pearsonr:{6:.2f} patience: {7}".
+                     format(uidx, valid_loss, valid_loss_hter, f1good, f1bad, f1multi, p, bad_count))
             if is_early_stop is True:
                 break
         if is_early_stop is True:
@@ -12040,7 +16939,6 @@ def finetune_qe_many(flags):
                 scheduler.step(global_step=uidx)
 
             seqs_x, seqs_y, xy_label, xy_hter, y_cnt = batch   # y_cnt，表示出现次数的文件
-            
             y_cnt = torch.tensor(y_cnt).cuda().squeeze(0)
             many_mask = y_cnt >= train_num_threshold
             unk_mask = (torch.tensor(seqs_y).cuda()) != 3
@@ -12053,21 +16951,20 @@ def finetune_qe_many(flags):
             training_progress_bar.update(n_samples_t)
 
             x, y, xy_label = prepare_data_qe(seqs_x, seqs_y, xy_label, cuda=Constants.USE_GPU)
-            
 
             if Constants.USE_GPU:
                 xy_hter = torch.tensor(xy_hter)
                 xy_hter = xy_hter.cuda()
             
             # 传进去一个mask，不足的token位置或者unk都是pad，0；其余足够的是1
-            loss, loss_hter = compute_forward_discriminator_many(model=discriminator,
+            loss, loss_hter = compute_forward_discriminator_token_mask(model=discriminator,
                                                             critic=critic,
                                                             critic_mse=critic_mse,
                                                             seqs_x=x,
                                                             seqs_y=y,
                                                             lm_ids=xy_label,
                                                             hter_label=xy_hter,
-                                                            many_mask=many_mask)
+                                                            token_mask=many_mask)
 
             train_loss += loss
             train_loss_hter += loss_hter
@@ -13091,7 +17988,7 @@ def test_qe(flags):
     INFO('Reloading transformer model parameters...')
     timer.tic()
     params = load_model_parameters(flags.pretrain_path, map_location="cpu")
-    discriminator.load_state_dict(params)
+    discriminator.load_state_dict(params, strict=False)
 
     if Constants.USE_GPU:
         discriminator.cuda()
@@ -13107,6 +18004,9 @@ def test_qe(flags):
     timer.tic()
 
     valid_iter = valid_iterator.build_generator()
+
+    add_align = False
+    if flags.add_align: add_align = True
 
     id = 0
     for batch_valid in tqdm(valid_iter):
@@ -13128,12 +18028,15 @@ def test_qe(flags):
 
             align_matrix_pad = F.pad(align_matrix, pad = (1, 1, 2, 1)).cuda()
 
-            with torch.no_grad():
-                log_probs, hter_pre = discriminator(x_valid, y_valid, align_matrix_pad = align_matrix_pad)
-
+            if add_align:
+                with torch.no_grad():
+                    log_probs, hter_pre = discriminator(x_valid, y_valid, align_matrix_pad = align_matrix_pad, align_ratio=flags.align_ratio, add_align=add_align)
+            elif flags.add_feature:
+                with torch.no_grad():
+                    log_probs, hter_pre = discriminator(x_valid, y_valid, align_matrix_pad = align_matrix_pad, add_feature = True)
         else:
             with torch.no_grad():
-                log_probs, hter_pre = discriminator(x_valid, y_valid)
+                log_probs, hter_pre = discriminator(x_valid, y_valid, requires_adapter=False)
 
         hter_pre.squeeze(1).cpu().tolist()
         for val in hter_pre:
@@ -13177,6 +18080,269 @@ def test_qe(flags):
                 for val in vals:
                     f.write(str(val) + ' ')
                 f.write('\n')
+
+
+def test_qe_ensemble(flags):
+    Constants.USE_GPU = flags.use_gpu
+
+    flags.batch_size = 1
+
+    config_path = os.path.abspath(flags.config_path)
+
+    with open(config_path.strip()) as f:
+        configs = yaml.safe_load(f)
+
+    discriminator_model_configs = configs['discriminator_configs']
+
+    data_configs = configs['data_configs']
+    #print(flags.batch_size)
+
+    timer = Timer()
+    # ================================================================================== #
+    # Load Data
+
+    INFO('Loading data...')
+    timer.tic()
+
+    # Generate target dictionary
+    vocab_src = Vocabulary.build_from_file(**data_configs['vocabularies'][0])
+    vocab_tgt = Vocabulary.build_from_file(**data_configs['vocabularies'][1])
+
+
+    valid_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=flags.source_path,
+                        vocabulary=vocab_src,
+                        ),
+        TextLineDataset(data_path=flags.target_path,
+                        vocabulary=vocab_tgt,
+                        )
+    )
+
+    valid_iterator = DataIterator(dataset=valid_bitext_dataset,
+                                  batch_size=flags.batch_size,
+                                  use_bucket=False, numbering=False)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    # 0. load transformer
+    INFO('Building transformer model...')
+    timer.tic()
+    discriminator = build_model(n_src_vocab=vocab_src.max_n_words,
+                                n_tgt_vocab=vocab_tgt.max_n_words, **discriminator_model_configs)
+    discriminator.eval()
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    pretrain_path_list = discriminator_model_configs["pretrain_path"]
+
+    result_log_ok_list = []
+    result_log_bad_list = []
+    result_hter_list = []
+    result_tag = []
+    
+    for pretrain_path in pretrain_path_list:
+
+        INFO('Reloading transformer model parameters...')
+        timer.tic()
+        params = load_model_parameters(pretrain_path, map_location="cpu")
+        discriminator.load_state_dict(params, strict=False)
+
+        if Constants.USE_GPU:
+            discriminator.cuda()
+        INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+        # ================================================================================== #
+
+        INFO('Begin ...')
+        result_hter = []
+        result_log_ok = []
+        result_log_bad = []
+
+        timer.tic()
+
+        valid_iter = valid_iterator.build_generator()
+
+        
+        id = 0
+        for batch_valid in tqdm(valid_iter):
+            seqs_x_valid, seqs_y_valid = batch_valid
+
+            x_valid, y_valid = prepare_data_qe(seqs_x_valid, seqs_y_valid, cuda=Constants.USE_GPU)
+
+            with torch.no_grad():
+                log_probs, hter_pre = discriminator(x_valid, y_valid, requires_adapter=False)
+
+            hter_pre.squeeze(1).cpu().tolist()
+            for val in hter_pre:
+                result_hter.append(float(val))
+            
+            log_probs = log_probs[0].cpu().tolist()
+            ok_tmp = []
+            bad_tmp = []
+            for i in log_probs:
+                ok_tmp.append(i[1])
+                bad_tmp.append(i[2])
+            result_log_ok.append(ok_tmp)
+            result_log_bad.append(bad_tmp)
+
+            id += 1
+
+        result_hter_list.append(result_hter)
+        result_log_ok_list.append(result_log_ok)
+        result_log_bad_list.append(result_log_bad)
+    
+    result_hter = [sum(x) / len(x) for x in zip(*result_hter_list)]   # 几个模型预测的hter列表取平均
+    result_log_ok = []
+    for item in zip(*result_log_ok_list):
+        result_log_ok.append([sum(x) / len(x) for x in zip(*item)])
+    result_log_bad = []
+    for item in zip(*result_log_bad_list):
+        result_log_bad.append([sum(x) / len(x) for x in zip(*item)])
+
+    for sent_ok, sent_bad in zip(result_log_ok, result_log_bad):
+        sent_tag = []
+        for ok_prob, bad_prob in zip(sent_ok, sent_bad):
+            if ok_prob < bad_prob:
+                sent_tag.append('BAD')
+            else:
+                sent_tag.append('OK')
+        result_tag.append(sent_tag)
+    
+
+    def auto_mkdir(path):
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+
+    auto_mkdir('/'.join(flags.saveto_hter.split('/')[0:-1]))
+    with open(flags.saveto_hter, 'w') as f:
+        for val in result_hter:
+            f.write('%.6f\n' % val)
+    
+    auto_mkdir('/'.join(flags.saveto_tags.split('/')[0:-1]))
+    with open(flags.saveto_tags, 'w') as f:
+        for vals in result_tag:
+            for val in vals:
+                f.write(val + ' ')
+            f.write('\n')
+
+
+
+def test_qe_one_class(flags):
+    Constants.USE_GPU = flags.use_gpu
+
+    flags.batch_size = 1
+
+    config_path = os.path.abspath(flags.config_path)
+
+    with open(config_path.strip()) as f:
+        configs = yaml.safe_load(f)
+
+    discriminator_model_configs = configs['discriminator_configs']
+
+    data_configs = configs['data_configs']
+    #print(flags.batch_size)
+
+    timer = Timer()
+    # ================================================================================== #
+    # Load Data
+
+    INFO('Loading data...')
+    timer.tic()
+
+    # Generate target dictionary
+    vocab_src = Vocabulary.build_from_file(**data_configs['vocabularies'][0])
+    vocab_tgt = Vocabulary.build_from_file(**data_configs['vocabularies'][1])
+
+    if flags.align_bpe_path_mt2src_test:
+        with open(flags.align_bpe_path_mt2src_test, 'r', encoding='utf-8') as f:
+            align_bpe_dict_mt2src_test = json.load(f)
+
+    valid_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=flags.source_path,
+                        vocabulary=vocab_src,
+                        ),
+        TextLineDataset(data_path=flags.target_path,
+                        vocabulary=vocab_tgt,
+                        )
+    )
+
+    valid_iterator = DataIterator(dataset=valid_bitext_dataset,
+                                  batch_size=flags.batch_size,
+                                  use_bucket=False, numbering=False)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    # 0. load transformer
+    INFO('Building transformer model...')
+    timer.tic()
+    discriminator = build_model(n_src_vocab=vocab_src.max_n_words,
+                                n_tgt_vocab=vocab_tgt.max_n_words, **discriminator_model_configs)
+    discriminator.eval()
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    INFO('Reloading transformer model parameters...')
+    timer.tic()
+    params = load_model_parameters(flags.pretrain_path, map_location="cpu")
+    discriminator.load_state_dict(params, strict=False)
+
+    if Constants.USE_GPU:
+        discriminator.cuda()
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    # ================================================================================== #
+
+    INFO('Begin ...')
+    result_hter = []
+    result_tag = []
+    #result_okprob = []
+
+    timer.tic()
+
+    valid_iter = valid_iterator.build_generator()
+
+    add_align = False
+    if flags.add_align: add_align = True
+
+    id = 0
+    for batch_valid in tqdm(valid_iter):
+        seqs_x_valid, seqs_y_valid = batch_valid
+
+        x_valid, y_valid = prepare_data_qe(seqs_x_valid, seqs_y_valid, cuda=Constants.USE_GPU)
+
+        with torch.no_grad():
+            log_probs, hter_pre = discriminator(x_valid, y_valid, one_class=True)
+    
+        hter_pre.squeeze(1).cpu().tolist()
+        for val in hter_pre:
+            result_hter.append(float(val))
+        
+        log_probs = log_probs[0].cpu().tolist()
+
+        outputs_tags_valid = []
+        for i in log_probs:
+            if i < 0.5:
+                outputs_tags_valid.append('BAD')
+            else:
+                outputs_tags_valid.append('OK')
+
+        result_tag.append(outputs_tags_valid)
+        id += 1
+        
+
+    def auto_mkdir(path):
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+
+    auto_mkdir('/'.join(flags.saveto_hter.split('/')[0:-1]))
+    with open(flags.saveto_hter, 'w') as f:
+        for val in result_hter:
+            f.write('%.6f\n' % val)
+    
+    auto_mkdir('/'.join(flags.saveto_tags.split('/')[0:-1]))
+    with open(flags.saveto_tags, 'w') as f:
+        for vals in result_tag:
+            for val in vals:
+                f.write(val + ' ')
+            f.write('\n')
 
 
 def test_qe_robust_before(flags):
@@ -13350,7 +18516,7 @@ def test_qe_robust(flags):
     INFO('Reloading transformer model parameters...')
     timer.tic()
     params = load_model_parameters(flags.pretrain_path, map_location="cpu")
-    discriminator.load_state_dict(params)
+    discriminator.load_state_dict(params, strict=False)
 
     if Constants.USE_GPU:
         discriminator.cuda()
@@ -13365,8 +18531,12 @@ def test_qe_robust(flags):
 
     valid_iter = valid_iterator.build_generator()
 
+    add_align = False
+    if flags.add_align: add_align = True
+
     id = 0
     for batch_valid in tqdm(valid_iter):
+        #if id >= 100: break
         seqs_x_valid, seqs_y_valid, robust_idx = batch_valid
         robust_idx = torch.tensor(robust_idx).squeeze(0).squeeze(0).int().tolist()
 
@@ -13386,12 +18556,15 @@ def test_qe_robust(flags):
 
             align_matrix_pad = F.pad(align_matrix, pad = (1, 1, 2, 1)).cuda()
 
-            with torch.no_grad():
-                log_probs, hter_pre = discriminator(x_valid, y_valid, align_matrix_pad = align_matrix_pad)
-
+            if add_align:
+                with torch.no_grad():
+                    log_probs, hter_pre = discriminator(x_valid, y_valid, align_matrix_pad = align_matrix_pad, align_ratio=flags.align_ratio, add_align=add_align)
+            elif flags.add_feature:
+                with torch.no_grad():
+                    log_probs, hter_pre = discriminator(x_valid, y_valid, align_matrix_pad = align_matrix_pad, add_feature = True)
         else:
             with torch.no_grad():
-                log_probs, hter_pre = discriminator(x_valid, y_valid)
+                log_probs, hter_pre = discriminator(x_valid, y_valid, requires_adapter=False)
 
         log_probs = log_probs[0].cpu().tolist()
         outputs_tags_valid = []
@@ -13414,6 +18587,170 @@ def test_qe_robust(flags):
     auto_mkdir('/'.join(flags.saveto_tags.split('/')[0:-1]))
     with open(flags.saveto_tags, 'w') as f:
         for vals in result_tag_robust:
+            for val in vals:
+                f.write(val + ' ')
+            f.write('\n')
+
+
+def test_qe_record_attn(flags):
+    Constants.USE_GPU = flags.use_gpu
+
+    flags.batch_size = 1
+
+    config_path = os.path.abspath(flags.config_path)
+
+    with open(config_path.strip()) as f:
+        configs = yaml.safe_load(f)
+
+    discriminator_model_configs = configs['discriminator_configs']
+
+    data_configs = configs['data_configs']
+    #print(flags.batch_size)
+
+    timer = Timer()
+    # ================================================================================== #
+    # Load Data
+
+    INFO('Loading data...')
+    timer.tic()
+
+    # Generate target dictionary
+    vocab_src = Vocabulary.build_from_file(**data_configs['vocabularies'][0])
+    vocab_tgt = Vocabulary.build_from_file(**data_configs['vocabularies'][1])
+
+    if flags.align_bpe_path_mt2src_test:
+        with open(flags.align_bpe_path_mt2src_test, 'r', encoding='utf-8') as f:
+            align_bpe_dict_mt2src_test = json.load(f)
+
+    valid_bitext_dataset = ZipDataset(
+        TextLineDataset(data_path=flags.source_path,
+                        vocabulary=vocab_src,
+                        ),
+        TextLineDataset(data_path=flags.target_path,
+                        vocabulary=vocab_tgt,
+                        )
+    )
+
+    valid_iterator = DataIterator(dataset=valid_bitext_dataset,
+                                  batch_size=flags.batch_size,
+                                  use_bucket=False, numbering=False)
+
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    # 0. load transformer
+    INFO('Building transformer model...')
+    timer.tic()
+    discriminator = build_model(n_src_vocab=vocab_src.max_n_words,
+                                n_tgt_vocab=vocab_tgt.max_n_words, **discriminator_model_configs)
+    discriminator.eval()
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    INFO('Reloading transformer model parameters...')
+    timer.tic()
+    params = load_model_parameters(flags.pretrain_path, map_location="cpu")
+    discriminator.load_state_dict(params, strict=False)
+
+    if Constants.USE_GPU:
+        discriminator.cuda()
+    INFO('Done. Elapsed time {0}'.format(timer.toc()))
+
+    # ================================================================================== #
+
+    INFO('Begin ...')
+    result_hter = []
+    result_tag = []
+    result_attn = []
+
+    timer.tic()
+
+    valid_iter = valid_iterator.build_generator()
+
+    add_align = False
+    if flags.add_align: add_align = True
+
+    id = 0
+    for batch_valid in tqdm(valid_iter):
+        if id <= 3: 
+            id += 1
+            continue
+        if id > 7: break
+        seqs_x_valid, seqs_y_valid = batch_valid
+
+        x_valid, y_valid = prepare_data_qe(seqs_x_valid, seqs_y_valid, cuda=Constants.USE_GPU)
+
+        align_line = align_bpe_dict_mt2src_test[str(id)]
+
+        x_len = x_valid.size(-1) - 2
+        y_len = y_valid.size(-1) - 3
+
+        align_matrix = torch.zeros([y_len, x_len])
+
+        for i in range(y_len):
+            if str(i) in align_line:
+                align_matrix[i] = align_matrix[i].index_fill(0, torch.tensor(align_line[str(i)]), True)
+
+        align_matrix = align_matrix.cuda()
+
+        def auto_mkdir(path):
+            if not os.path.exists(path):
+                os.makedirs(path, exist_ok=True)
+
+        auto_mkdir(flags.plot_path_prefix)
+
+        # 这里要改，最好让模型返回attn，然后计算比例
+        with torch.no_grad():
+            log_probs, hter_pre, ctx_attn = discriminator(x_valid, y_valid, return_attn=True)
+
+            # ctx_attn 一个列表，包括所有layer的attn: [batch_size, head_num, query_len, key_len]
+            ctx_attn_all = torch.stack(ctx_attn, dim = 1) # [batch_size, layer_num, head_num, query_len, key_len]
+            
+            # 选择前两个attn head，作为对齐训练attn
+            #ctx_attn_align_head = ctx_attn_all[:, :, :, 2:-1, 1:-1].squeeze(0)   # 去掉无关部分，<bos><eos> 这里把hter也去掉了，可能会有影响？
+            ctx_attn_align_head = ctx_attn_all.squeeze(0)
+            # 如果包括<bos><eos>的话，attn分数之和就是1。某些mt token还是很关注源端的bos eos的
+            ctx_attn_align = ctx_attn_align_head.reshape(-1, y_len + 3, x_len + 2)   # [layer_num * choosed_head_num, seq_y, seq_x]
+            ctx_attn_mean = ctx_attn_align.mean(0)
+
+            # 画个图吧！
+            plot_attribution_src(attr_token_src = ctx_attn_mean.transpose(0, 1), 
+                                plot_path_prefix = flags.plot_path_prefix, 
+                                mt_tokens = y_valid[0], src_tokens = x_valid[0],
+                                mt_dict = vocab_tgt, src_dict = vocab_src,
+                                id = id, gradients_type = "attn")
+  
+            #align_matrix_repeat = align_matrix.repeat(ctx_attn_align.size(0), 1, 1)
+            
+
+        hter_pre.squeeze(1).cpu().tolist()
+        for val in hter_pre:
+            result_hter.append(float(val))
+        
+        log_probs = log_probs[0].cpu().tolist()
+        outputs_tags_valid = []
+        outputs_okprob = []
+        for i in log_probs:
+            outputs_okprob.append(math.exp(i[1]))
+            if i[1] < i[2]:
+                outputs_tags_valid.append('BAD')  # 1 ok    2 bad
+            else:
+                outputs_tags_valid.append('OK')
+
+        result_tag.append(outputs_tags_valid)
+        id += 1
+        
+
+    def auto_mkdir(path):
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+
+    auto_mkdir('/'.join(flags.saveto_hter.split('/')[0:-1]))
+    with open(flags.saveto_hter, 'w') as f:
+        for val in result_hter:
+            f.write('%.6f\n' % val)
+    
+    auto_mkdir('/'.join(flags.saveto_tags.split('/')[0:-1]))
+    with open(flags.saveto_tags, 'w') as f:
+        for vals in result_tag:
             for val in vals:
                 f.write(val + ' ')
             f.write('\n')
@@ -13567,7 +18904,7 @@ def test_qe_show_onecase(flags):
     INFO('Reloading transformer model parameters...')
     timer.tic()
     params = load_model_parameters(flags.pretrain_path, map_location="cpu")
-    discriminator.load_state_dict(params)
+    discriminator.load_state_dict(params, strict=False)
 
     if Constants.USE_GPU:
         discriminator.cuda()
@@ -13581,6 +18918,11 @@ def test_qe_show_onecase(flags):
 
     seqs_x_valid = [vocab_src.sent2ids(flags.src_sent)]
     seqs_y_valid = [vocab_tgt.sent2ids(flags.mt_sent)]
+
+    print("mt_sent")
+    print(flags.mt_sent)
+    print("seqs_y_valid")
+    print(seqs_y_valid)
 
     x_valid, y_valid = prepare_data_qe(seqs_x_valid, seqs_y_valid, cuda=Constants.USE_GPU)
 

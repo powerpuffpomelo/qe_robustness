@@ -55,6 +55,8 @@ for i in range(microtransquest_config["n_fold"]):
     dev_fold_sources_tags.append(dev_sources_tags)
     dev_fold_targets_tags.append(dev_targets_tags)
 
+# --------- Test Predictions -----------
+
 source_predictions = []
 for sentence_id in range(len(test_sentences)):
     majority_prediction = []

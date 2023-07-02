@@ -1,10 +1,10 @@
-SRC_ORIGIN_PATH=/data1/yanym/data/toy_contrastive/data_1000/toy_parallel_train.src
-TGT_ORIGIN_PATH=/data1/yanym/data/toy_contrastive/data_1000/toy_pseudo_train.mt
+SRC_ORIGIN_PATH=/data1/yanym/data/robust_qe_test_word2vec_limit_3_10/robust_test.mt
+TGT_ORIGIN_PATH=/data1/yanym/data/robust_qe_test_word2vec_limit_3_10/robust_test.src
 SRC_BPE_PATH=$SRC_ORIGIN_PATH.BPE
 TGT_BPE_PATH=$TGT_ORIGIN_PATH.BPE
 
 MODEL_NAME_OR_PATH=bert-base-multilingual-cased
-ALIGN_FILE=/data1/yanym/data/toy_contrastive/data_1000/toy_parallel_train.srcmt.alignments
+ALIGN_FILE=/data1/yanym/data/robust_qe_test_word2vec_limit_3_10/align/robust_test.mt-src.alignments
 ALIGN_INPUT_PATH=$ALIGN_FILE.input
 ALIGN_FILE_BPE=$ALIGN_FILE.BPE
 

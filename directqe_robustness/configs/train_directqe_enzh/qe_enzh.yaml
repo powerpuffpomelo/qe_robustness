@@ -70,6 +70,7 @@ optimizer_configs:
 training_configs:
   seed: 1234
   max_epochs: 50
+  min_epochs: 2
   shuffle: false
   use_bucket: false
   buffer_size: 1000

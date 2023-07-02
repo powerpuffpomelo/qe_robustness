@@ -2,10 +2,16 @@ import pandas as pd
 
 
 def prepare_data(raw_df, args):
+    robust = False
+
+    if "robust_idx" in raw_df.columns: robust = True
+
     source_sentences = raw_df["source"].tolist()
     source_tags = raw_df["source_tags"].tolist()
     target_sentences = raw_df["target"].tolist()
     target_tags = raw_df["target_tags"].tolist()
+    if robust:
+        robust_idx = raw_df["robust_idx"].tolist()
 
     sentence_id = 0
     data = []

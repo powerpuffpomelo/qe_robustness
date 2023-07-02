@@ -250,8 +250,6 @@ class MultiHeadedAttentionAligned(nn.Module):
         self.final_linear = nn.Linear(self.dim_per_head * head_count, model_dim)
         self.exclude_diagonal = exclude_diagonal
 
-        self.align_lambda = 5
-
     def _split_heads(self, x):
 
         batch_size = x.size(0)
@@ -268,7 +266,7 @@ class MultiHeadedAttentionAligned(nn.Module):
         return x.view(-1, self.head_count, seq_len, self.dim_per_head).transpose(1, 2).contiguous() \
             .view(-1, seq_len, self.head_count * self.dim_per_head)
 
-    def forward(self, key, value, query, mask=None, enc_attn_cache=None, self_attn_cache=None, align_matrix_pad=None):
+    def forward(self, key, value, query, mask=None, enc_attn_cache=None, self_attn_cache=None, align_matrix_pad=None, align_ratio=0):
         """
         Compute the context vector and the attention vectors.
 
@@ -325,7 +323,7 @@ class MultiHeadedAttentionAligned(nn.Module):
 
         if align_matrix_pad is not None:
             align_matrix_pad = align_matrix_pad.repeat(8, 1, 1)
-            scores = scores + self.align_lambda * align_matrix_pad  # attn和对齐信息加权融合
+            scores = (1 - align_ratio) * scores + align_ratio * align_matrix_pad  # attn和对齐信息加权融合
 
         # 3) Apply attention dropout and compute context vectors.
         attn = F.softmax(scores, dim=-1)  # [bsz * n_head, q_len, k_len]  这里q_len是y长度+3，k_len是x长度+2

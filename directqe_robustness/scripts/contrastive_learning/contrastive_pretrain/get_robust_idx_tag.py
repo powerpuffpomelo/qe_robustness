@@ -1,8 +1,8 @@
 # 只得到idx处的预测tag存起来，其余tag不care
 
-all_tag_path = "/data1/yanym/data/robust_qe_test/generate_dev/robust_test.tag"
-robust_idx_path = "/data1/yanym/data/robust_qe_test/generate_dev/robust_test.idx"
-robust_tag_path = "/data1/yanym/data/robust_qe_test/generate_dev/robust_test.tag_idxonly"
+all_tag_path = "/data1/yanym/data/robust_language_model_wmt21/train_limit3_10_double/robust_train.mt_tag"
+robust_idx_path = "/data1/yanym/data/robust_language_model_wmt21/train_limit3_10_double/robust_train.idx"
+robust_tag_path = "/data1/yanym/data/robust_language_model_wmt21/train_limit3_10_double/robust_train.tag_idxonly"
 
 with open(all_tag_path, 'r', encoding='utf-8') as ft, open(robust_idx_path, 'r', encoding='utf-8') as fid, \
     open(robust_tag_path, 'w', encoding='utf-8') as fsave:

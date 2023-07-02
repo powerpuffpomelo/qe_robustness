@@ -1,10 +1,10 @@
 data_configs:
   lang_pair: "zh-en"
   train_data:
-    - "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/train.src.BPE"
-    - "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/train.mt.BPE"
-    - "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/train.tag.BPE"
-    - "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/train.hter"
+    - "/home/data_ti4_c/yanym/data/wmt20/enzh/parallel/wmt20_enzh_pseudo/pseudo_train_v2.src.BPE"
+    - "/home/data_ti4_c/yanym/data/wmt20/enzh/parallel/wmt20_enzh_pseudo/pseudo_train_v2.mt.BPE"
+    - "/home/data_ti4_c/yanym/data/wmt20/enzh/parallel/wmt20_enzh_pseudo/pseudo_train_v2.tag.BPE"
+    - "/home/data_ti4_c/yanym/data/wmt20/enzh/parallel/wmt20_enzh_pseudo/pseudo_train_v2.hter"
   vocabularies:
     - type: "bpe"
       dict_path: "/home/data_ti4_c/yanym/data/wmt20/enzh/parallel/mello_version/vocab.en"

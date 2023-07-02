@@ -39,6 +39,9 @@ parser.add_argument("--align_bpe_path_mt2src_train", type=str, default="",
 parser.add_argument("--align_bpe_path_mt2src_dev", type=str, default="",
                     help="""Path to align bpe file""")
 
+parser.add_argument("--align_ratio", type=float, default=0,
+                    help="""ratio of align_matrix.   1-align_ratio = ratio of attn_matrix""")
+
 parser.add_argument('--level', type=str, default=None, help='sentence level or word level')
 
 parser.add_argument("--multi_gpu", action="store_true",

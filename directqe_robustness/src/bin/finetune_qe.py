@@ -25,6 +25,9 @@ parser.add_argument('--seed', type=int, default="1234")
 parser.add_argument('--saveto', type=str, default="./save",
                     help="The path for saving models. Default is ./save.")
 
+parser.add_argument('--criterion', type=str, default="nll_loss",
+                    help="criterion")
+
 parser.add_argument('--debug', action="store_true",
                     help="Use debug mode.")
 

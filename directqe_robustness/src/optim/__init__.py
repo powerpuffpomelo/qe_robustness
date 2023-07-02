@@ -40,8 +40,8 @@ class Optimizer(object):
     @staticmethod
     def get_params(model):
         """Returns all name, parameter pairs with requires_grad=True."""
-        return list(
-            filter(lambda p: p[1].requires_grad, model.named_parameters()))
+        return list(filter(lambda p: p[1].requires_grad, model.named_parameters()))
+        #return list(model.named_parameters())
 
     def __init__(self,
                  name,
@@ -102,6 +102,9 @@ class Optimizer(object):
         for group in self.param_groups:
             n_params -= len(group['params'])
         assert n_params == 0, "Not all params are passed to the optimizer."
+
+        #print("==========self.named_params")
+        #print(self.named_params)
 
         # Create the actual optimizer
         self.optim = OPTIMIZERS[self.name](self.param_groups, **self.optim_args)  # torch.optim.Adam

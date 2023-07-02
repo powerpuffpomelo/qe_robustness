@@ -375,7 +375,8 @@ class ZipDataset(Dataset):
         self.set_size(len(self.datasets[0]))
     
     def __getitem__(self, id):
-        
+        #cls = type(self)
+        #return cls(datasets=[d[id] for d in self.datasets], set_size=len(self.datasets[id]))
         return [d[id] for d in self.datasets]
 
     def showitem(self, id):

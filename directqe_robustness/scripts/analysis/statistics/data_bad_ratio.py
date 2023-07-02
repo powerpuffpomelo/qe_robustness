@@ -2,7 +2,7 @@
 
 
 #qe_train_tag_path = "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/train.tag"
-qe_train_tag_path = "/data1/yanym/save/directqe_enzh/discriminator_finetuned_256_aug2_real_switch/test_result_4800/train.tag"
+qe_train_tag_path = "/data1/yanym/save/directqe_enzh_bpe_robust/imp_2finetune/discriminator_finetuned_256_imp_v1_c_mask1_word2vec_double/test_result/robust_test_word2vec_limit_3_10.tag_idxonly.BPE"
 #qe_train_hter_path = "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/dev.hter"
 #qe_train_hter_path = "/home/yanym/save/enzh/generate_dev/mlm_dev.hter"
 

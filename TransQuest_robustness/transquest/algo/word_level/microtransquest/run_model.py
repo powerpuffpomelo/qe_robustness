@@ -316,6 +316,9 @@ class MicroTransQuestModel:
                     }
 
                 """
+                #print("model_name")
+                #print(model_name)
+                #"/home/yanym/transformers/xlm-roberta-large"
                 self.model = model_class.from_pretrained(model_name, config=self.config, **kwargs) # 要重载这个model函数的forward
             else:
                 #print("bbbbbbbbbbbbbbbb") 没经过
@@ -655,7 +658,12 @@ class MicroTransQuestModel:
                     continue
                 batch = tuple(t.to(device) for t in batch)
 
+                print("================= batch")
+                print(batch)
+
                 inputs = self._get_inputs_dict(batch)
+                print("================= inputs")
+                print(inputs)
 
                 if self.args.fp16:
                     with amp.autocast():

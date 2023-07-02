@@ -1,4 +1,4 @@
-tag_path = "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/test.tag.BPE"
+tag_path = "/home/data_ti4_c/yanym/data/wmt20/enzh/task2/mello_version/train.mt"
 num = 0
 
 with open(tag_path, 'r', encoding='utf-8') as f:
