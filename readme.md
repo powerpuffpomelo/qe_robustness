@@ -39,12 +39,15 @@
 > Gold tag: BAD OK OK OK OK OK BAD BAD BAD OK BAD
 
 该样本衍生出了三条鲁棒性伪数据，分别修改了三处源端：
+
 ![图片](figures/robust_src.png "鲁棒性伪数据的源端")
 
 它们的mt都是一致的：
+
 ![图片](figures/robust_tgt.png "鲁棒性伪数据的目标端")
 
 被修改源端的mt token，在原测试样本中标签为ok，修改后标签为bad：
+
 ![图片](figures/robust_tag.png "鲁棒性测试标签")
 
 ### 文件说明
